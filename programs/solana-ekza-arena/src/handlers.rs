@@ -6,18 +6,20 @@ use anchor_spl::metadata::{
 use anchor_spl::token::{mint_to, MintTo};
 
 use crate::{
-    affix::roll_item,
+    affix::{roll_item, roll_item_capped, RARITY_LEGENDARY},
     constants::{
         MAX_BUILTIN_SKINS, RELEASE_DEPLOYMENT_PROJECT_ARENA, RELEASE_STATUS_FINALIZED,
-        RELEASE_STATUS_LINKED,
+        RELEASE_STATUS_LINKED, REVEAL_DELAY_SLOTS,
     },
     contexts::{
-        MintArenaItem, RegisterArenaAsset, RegisterArenaAssetFromStellar, ScrapArenaItem,
+        CommitMint, ConfigureRegistry, MintArenaItem, RegisterArenaAsset,
+        RegisterArenaAssetFromStellar, RevealMint, ScrapArenaItem,
     },
     error::ArenaRegistryError,
     state::{
-        ArenaAffix, ArenaAssetData, ArenaCardKind, ArenaElement, ArenaRarity, ArenaStats, ItemSkin,
-        MintArenaItemArgs, MintSkinArg, RegisterArenaAssetArgs, RegisterArenaAssetFromStellarArgs,
+        ArenaAffix, ArenaAssetData, ArenaCardKind, ArenaElement, ArenaRarity, ArenaStats,
+        CommitMintArgs, ConfigureRegistryArgs, ItemSkin, MintArenaItemArgs, MintSkinArg,
+        RegisterArenaAssetArgs, RegisterArenaAssetFromStellarArgs,
     },
     utils::validate_stellar_release,
     utils::{
@@ -247,10 +249,43 @@ fn recent_slothash_u64(slot_hashes: &AccountInfo) -> Result<u64> {
     Ok(u64::from_le_bytes(data[16..24].try_into().unwrap()))
 }
 
+/// First 8 bytes (LE u64) of the hash of EXACTLY `target_slot` from the
+/// SlotHashes sysvar (spec §12.1). SlotHashes holds ~512 recent entries, newest
+/// first: `[len: u64][ (slot: u64, hash: [u8;32]) ; len ]`. Returns
+/// `SlotHashNotFound` if `target_slot` has aged out (or never existed).
+fn slothash_of_slot(slot_hashes: &AccountInfo, target_slot: u64) -> Result<u64> {
+    let data = slot_hashes.try_borrow_data()?;
+    require!(data.len() >= 8, ArenaRegistryError::InvalidSlotHashes);
+    let len = u64::from_le_bytes(data[0..8].try_into().unwrap()) as usize;
+    // Each entry = 8 (slot) + 32 (hash) = 40 bytes, starting at offset 8.
+    for i in 0..len {
+        let base = 8 + i * 40;
+        if data.len() < base + 40 {
+            break;
+        }
+        let slot = u64::from_le_bytes(data[base..base + 8].try_into().unwrap());
+        if slot == target_slot {
+            let hash_off = base + 8;
+            return Ok(u64::from_le_bytes(
+                data[hash_off..hash_off + 8].try_into().unwrap(),
+            ));
+        }
+    }
+    Err(ArenaRegistryError::SlotHashNotFound.into())
+}
+
 /// Resolve the requested skin into the persisted `ItemSkin` (spec §2).
 /// Stellar skins reuse the validated-release pattern; they contribute looks
 /// only (the resolved value is the Stellar *asset* pubkey), never balance.
-fn resolve_skin(ctx: &Context<MintArenaItem>, skin: MintSkinArg) -> Result<ItemSkin> {
+///
+/// Account-based so both `mint_arena_item` and `reveal_mint` can call it with
+/// their (optional) Stellar accounts.
+fn resolve_skin_accounts<'info>(
+    skin: MintSkinArg,
+    stellar_program: Option<&AccountInfo<'info>>,
+    stellar_release: Option<&AccountInfo<'info>>,
+    stellar_vault: Option<&AccountInfo<'info>>,
+) -> Result<ItemSkin> {
     match skin {
         MintSkinArg::Builtin(id) => {
             require!(id < MAX_BUILTIN_SKINS, ArenaRegistryError::InvalidSkin);
@@ -264,21 +299,12 @@ fn resolve_skin(ctx: &Context<MintArenaItem>, skin: MintSkinArg) -> Result<ItemS
             Ok(ItemSkin::Ipfs(hash))
         }
         MintSkinArg::Stellar => {
-            let stellar_program = ctx
-                .accounts
-                .stellar_program
-                .as_ref()
-                .ok_or(ArenaRegistryError::MissingStellarSkinAccounts)?;
-            let stellar_release = ctx
-                .accounts
-                .stellar_release
-                .as_ref()
-                .ok_or(ArenaRegistryError::MissingStellarSkinAccounts)?;
-            let stellar_vault = ctx
-                .accounts
-                .stellar_vault
-                .as_ref()
-                .ok_or(ArenaRegistryError::MissingStellarSkinAccounts)?;
+            let stellar_program =
+                stellar_program.ok_or(ArenaRegistryError::MissingStellarSkinAccounts)?;
+            let stellar_release =
+                stellar_release.ok_or(ArenaRegistryError::MissingStellarSkinAccounts)?;
+            let stellar_vault =
+                stellar_vault.ok_or(ArenaRegistryError::MissingStellarSkinAccounts)?;
 
             let origin =
                 validate_stellar_release(stellar_program, stellar_release, stellar_vault)?;
@@ -290,6 +316,15 @@ fn resolve_skin(ctx: &Context<MintArenaItem>, skin: MintSkinArg) -> Result<ItemS
             Ok(ItemSkin::StellarAsset(origin.asset))
         }
     }
+}
+
+fn resolve_skin(ctx: &Context<MintArenaItem>, skin: MintSkinArg) -> Result<ItemSkin> {
+    resolve_skin_accounts(
+        skin,
+        ctx.accounts.stellar_program.as_ref(),
+        ctx.accounts.stellar_release.as_ref(),
+        ctx.accounts.stellar_vault.as_ref(),
+    )
 }
 
 pub fn mint_arena_item(ctx: Context<MintArenaItem>, args: MintArenaItemArgs) -> Result<()> {
@@ -318,8 +353,11 @@ pub fn mint_arena_item(ctx: Context<MintArenaItem>, args: MintArenaItemArgs) -> 
     let index = ctx.accounts.registry.next_index;
     let seed = crate::affix::splitmix64_mix(slothash_u64 ^ minter_first8 ^ index);
 
-    // Roll the item (spec §5/§10).
-    let rolled = roll_item(seed, args.base_type.to_roll());
+    // INTEGRITY (spec §12.1): this is the 1-tx dev/non-valuable path whose seed
+    // is fully known at tx time, so it is revert-grindable. To protect the
+    // jackpot it is hard-capped at Legendary and CANNOT roll Mythic — only the
+    // commit-reveal `reveal_mint` can. Mythic rides on unpredictable randomness.
+    let rolled = roll_item_capped(seed, args.base_type.to_roll(), RARITY_LEGENDARY);
 
     // --- Mint the real NFT (spec §11.2): supply 1, decimals 0, Master Edition. ---
     // 1. Mint the single token to the minter's ATA.
@@ -411,6 +449,9 @@ pub fn mint_arena_item(ctx: Context<MintArenaItem>, args: MintArenaItemArgs) -> 
     item.minter = minter;
     item.mint = mint_key;
     item.index = index;
+    // Forward-compat (spec §12.3): defaulted at mint, no mutator yet.
+    item.enhance_level = 0;
+    item.sockets = Vec::new();
     item.bump = ctx.bumps.arena_item;
 
     Ok(())
@@ -439,5 +480,225 @@ pub fn scrap_arena_item(ctx: Context<ScrapArenaItem>) -> Result<()> {
         None,
     )?;
 
+    Ok(())
+}
+
+/// Validate the NFT metadata strings shared by both mint paths (spec §11.2).
+fn validate_nft_metadata(name: &str, symbol: &str, uri: &str) -> Result<()> {
+    require!(
+        !name.is_empty() && name.len() <= MintArenaItemArgs::MAX_NAME_LEN,
+        ArenaRegistryError::InvalidNftMetadata
+    );
+    require!(
+        !symbol.is_empty() && symbol.len() <= MintArenaItemArgs::MAX_SYMBOL_LEN,
+        ArenaRegistryError::InvalidNftMetadata
+    );
+    require!(
+        !uri.is_empty() && uri.len() <= MintArenaItemArgs::MAX_URI_LEN,
+        ArenaRegistryError::InvalidNftMetadata
+    );
+    Ok(())
+}
+
+/// Configure the registry's commit-reveal economics (spec §12.1).
+pub fn configure_registry(
+    ctx: Context<ConfigureRegistry>,
+    args: ConfigureRegistryArgs,
+) -> Result<()> {
+    let registry = &mut ctx.accounts.registry;
+    registry.bump = ctx.bumps.registry;
+    registry.treasury = args.treasury;
+    registry.commit_fee_lamports = args.commit_fee_lamports;
+    Ok(())
+}
+
+/// `commit_mint` (spec §12.1): persist the intent, lock a FUTURE slot, and
+/// charge the non-refundable commit fee to the treasury. No roll happens here.
+pub fn commit_mint(ctx: Context<CommitMint>, args: CommitMintArgs) -> Result<()> {
+    validate_nft_metadata(&args.name, &args.symbol, &args.uri)?;
+
+    let registry = &ctx.accounts.registry;
+    // The registry must have been configured with a real treasury + fee.
+    require!(
+        registry.treasury != Pubkey::default(),
+        ArenaRegistryError::RegistryNotConfigured
+    );
+    require_keys_eq!(
+        ctx.accounts.treasury.key(),
+        registry.treasury,
+        ArenaRegistryError::InvalidTreasury
+    );
+
+    // Validate the skin arg cheaply at commit time (Stellar accounts are not
+    // required here — they are supplied at reveal). Builtin/Ipfs are fully
+    // checked; Stellar is accepted and re-validated at reveal.
+    match &args.skin {
+        MintSkinArg::Builtin(id) => {
+            require!(*id < MAX_BUILTIN_SKINS, ArenaRegistryError::InvalidSkin)
+        }
+        MintSkinArg::Ipfs(hash) => require!(
+            !hash.is_empty() && hash.len() <= ItemSkin::MAX_IPFS_LEN,
+            ArenaRegistryError::InvalidSkin
+        ),
+        MintSkinArg::Stellar => {}
+    }
+
+    // Charge the non-refundable commit fee: minter -> treasury (system transfer).
+    let fee = registry.commit_fee_lamports;
+    if fee > 0 {
+        anchor_lang::system_program::transfer(
+            CpiContext::new(
+                ctx.accounts.system_program.to_account_info(),
+                anchor_lang::system_program::Transfer {
+                    from: ctx.accounts.minter.to_account_info(),
+                    to: ctx.accounts.treasury.to_account_info(),
+                },
+            ),
+            fee,
+        )?;
+    }
+
+    let target_slot = Clock::get()?
+        .slot
+        .checked_add(REVEAL_DELAY_SLOTS)
+        .ok_or(ArenaRegistryError::NumericalOverflow)?;
+
+    let commit = &mut ctx.accounts.mint_commit;
+    commit.minter = ctx.accounts.minter.key();
+    commit.nonce = args.nonce;
+    commit.target_slot = target_slot;
+    commit.base_type = args.base_type;
+    commit.skin = args.skin;
+    commit.name = args.name;
+    commit.symbol = args.symbol;
+    commit.uri = args.uri;
+    commit.bump = ctx.bumps.mint_commit;
+
+    Ok(())
+}
+
+/// `reveal_mint` (spec §12.1): roll from the committed slot's now-known hash,
+/// mint the NFT (spec §11), write `ArenaItem`, and close the `MintCommit`.
+/// This is the ONLY path that can roll Mythic. Single-shot.
+pub fn reveal_mint(ctx: Context<RevealMint>, _nonce: u64) -> Result<()> {
+    // 1. Enforce the reveal window: the target slot must have PASSED, and its
+    //    hash must still be retrievable from SlotHashes (spec §12.1).
+    let target_slot = ctx.accounts.mint_commit.target_slot;
+    let now = Clock::get()?.slot;
+    require!(now > target_slot, ArenaRegistryError::RevealTooEarly);
+    let slothash_u64 = slothash_of_slot(&ctx.accounts.slot_hashes, target_slot)?;
+
+    // 2. Seed = splitmix64_mix(target_slothash ^ minter_first8 ^ commit_first8).
+    let minter = ctx.accounts.minter.key();
+    let minter_first8 = u64::from_le_bytes(minter.to_bytes()[0..8].try_into().unwrap());
+    let commit_key = ctx.accounts.mint_commit.key();
+    let commit_first8 = u64::from_le_bytes(commit_key.to_bytes()[0..8].try_into().unwrap());
+    let seed = crate::affix::splitmix64_mix(slothash_u64 ^ minter_first8 ^ commit_first8);
+
+    // 3. Roll — full ladder (CAN be Mythic). Resolve the committed skin.
+    let base_type = ctx.accounts.mint_commit.base_type;
+    let skin_arg = ctx.accounts.mint_commit.skin.clone();
+    let rolled = roll_item(seed, base_type.to_roll());
+    let skin_ref = resolve_skin_accounts(
+        skin_arg,
+        ctx.accounts.stellar_program.as_ref(),
+        ctx.accounts.stellar_release.as_ref(),
+        ctx.accounts.stellar_vault.as_ref(),
+    )?;
+
+    // 4. Mint the real NFT (spec §11.2): supply 1, decimals 0, Master Edition.
+    mint_to(
+        CpiContext::new(
+            ctx.accounts.token_program.to_account_info(),
+            MintTo {
+                mint: ctx.accounts.mint.to_account_info(),
+                to: ctx.accounts.minter_token_account.to_account_info(),
+                authority: ctx.accounts.minter.to_account_info(),
+            },
+        ),
+        1,
+    )?;
+
+    let data = DataV2 {
+        name: ctx.accounts.mint_commit.name.clone(),
+        symbol: ctx.accounts.mint_commit.symbol.clone(),
+        uri: ctx.accounts.mint_commit.uri.clone(),
+        seller_fee_basis_points: 0,
+        creators: None,
+        collection: None,
+        uses: None,
+    };
+    create_metadata_accounts_v3(
+        CpiContext::new(
+            ctx.accounts.token_metadata_program.to_account_info(),
+            CreateMetadataAccountsV3 {
+                metadata: ctx.accounts.metadata_account.to_account_info(),
+                mint: ctx.accounts.mint.to_account_info(),
+                mint_authority: ctx.accounts.minter.to_account_info(),
+                payer: ctx.accounts.minter.to_account_info(),
+                update_authority: ctx.accounts.minter.to_account_info(),
+                system_program: ctx.accounts.system_program.to_account_info(),
+                rent: ctx.accounts.rent.to_account_info(),
+            },
+        ),
+        data,
+        false, // is_mutable
+        true,  // update_authority_is_signer
+        None,  // collection_details
+    )?;
+
+    create_master_edition_v3(
+        CpiContext::new(
+            ctx.accounts.token_metadata_program.to_account_info(),
+            CreateMasterEditionV3 {
+                edition: ctx.accounts.master_edition.to_account_info(),
+                mint: ctx.accounts.mint.to_account_info(),
+                update_authority: ctx.accounts.minter.to_account_info(),
+                mint_authority: ctx.accounts.minter.to_account_info(),
+                payer: ctx.accounts.minter.to_account_info(),
+                metadata: ctx.accounts.metadata_account.to_account_info(),
+                token_program: ctx.accounts.token_program.to_account_info(),
+                system_program: ctx.accounts.system_program.to_account_info(),
+                rent: ctx.accounts.rent.to_account_info(),
+            },
+        ),
+        Some(0),
+    )?;
+
+    // 5. Persist game stats, bound 1:1 to the mint (spec §11.2).
+    let mint_key = ctx.accounts.mint.key();
+    let registry = &mut ctx.accounts.registry;
+    registry.bump = ctx.bumps.registry;
+    let index = registry.next_index;
+    registry.next_index = registry
+        .next_index
+        .checked_add(1)
+        .ok_or(ArenaRegistryError::NumericalOverflow)?;
+
+    let item = &mut ctx.accounts.arena_item;
+    item.seed = seed;
+    item.base_type = base_type;
+    item.tier = rolled.tier;
+    item.rarity = ArenaRarity::from_roll(rolled.rarity);
+    item.affixes = rolled
+        .affixes
+        .iter()
+        .map(|a| ArenaAffix {
+            kind: a.kind,
+            value: a.value,
+            element: a.element,
+        })
+        .collect();
+    item.skin_ref = skin_ref;
+    item.minter = minter;
+    item.mint = mint_key;
+    item.index = index;
+    // Forward-compat (spec §12.3): defaulted at mint, no mutator yet.
+    item.enhance_level = 0;
+    item.sockets = Vec::new();
+    item.bump = ctx.bumps.arena_item;
+
+    // 6. `MintCommit` is closed by the `close = minter` constraint (rent →
+    //    minter). Single-shot: this commit can never be revealed again.
     Ok(())
 }

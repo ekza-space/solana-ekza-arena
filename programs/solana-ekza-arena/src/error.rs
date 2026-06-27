@@ -34,4 +34,12 @@ pub enum ArenaRegistryError {
     InvalidNftMetadata,
     #[msg("The signer is not the current holder of the item NFT.")]
     NotNftHolder,
+    #[msg("Reveal attempted before the committed target slot has passed.")]
+    RevealTooEarly,
+    #[msg("The committed target slot's hash is no longer in the SlotHashes sysvar.")]
+    SlotHashNotFound,
+    #[msg("The registry has not been configured with a treasury / commit fee.")]
+    RegistryNotConfigured,
+    #[msg("The supplied treasury account does not match the configured treasury.")]
+    InvalidTreasury,
 }

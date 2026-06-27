@@ -117,33 +117,38 @@ pub const KIND_LIFESTEAL: u8 = 7;
 pub const KIND_CRIT: u8 = 8;
 
 // ---------------------------------------------------------------------------
-// Rarity (Common, Rare, Epic, Legendary) — spec §6/§10
+// Rarity (Common, Rare, Epic, Legendary, Mythic) — spec §6/§10/§12.2
 // ---------------------------------------------------------------------------
 
 pub const RARITY_COMMON: u8 = 0;
 pub const RARITY_RARE: u8 = 1;
 pub const RARITY_EPIC: u8 = 2;
 pub const RARITY_LEGENDARY: u8 = 3;
+/// v4 god-roll tier (~1 in 1000). Only the commit-reveal mint path may produce
+/// this; the 1-tx dev mint is hard-capped at Legendary (spec §12.1/§12.2).
+pub const RARITY_MYTHIC: u8 = 4;
 
 // ---------------------------------------------------------------------------
 // PINNED TABLES (THE CANON — the frontend copies these byte-identically)
 // ---------------------------------------------------------------------------
 
-/// RARITY_TABLE: Common 60 | Rare 28 | Epic 9 | Legendary 3 (weights, spec §6).
-pub const RARITY_WEIGHTS: [u32; 4] = [60, 28, 9, 3];
+/// RARITY_TABLE (v4, spec §12.2): Common 600 | Rare 280 | Epic 90 |
+/// Legendary 29 | Mythic 1. Sum = 1000 ⇒ Mythic = 0.1% = 1/1000.
+pub const RARITY_WEIGHTS: [u32; 5] = [600, 280, 90, 29, 1];
 
-/// TIER_BY_RARITY: Common 1 | Rare 2 | Epic 3 | Legendary 4 (spec §6).
-/// Tier is deterministic — no jitter.
-pub const TIER_BY_RARITY: [u8; 4] = [1, 2, 3, 4];
+/// TIER_BY_RARITY (v4): Common 1 | Rare 2 | Epic 3 | Legendary 4 | Mythic 5
+/// (spec §12.2). Tier is deterministic — no jitter. Mythic's tier 5 (×5 primary
+/// range) is what makes the god-roll's stats outsized.
+pub const TIER_BY_RARITY: [u8; 5] = [1, 2, 3, 4, 5];
 
-/// SECONDARY_COUNT_BY_RARITY (spec §10.3 step 4):
-/// Common 0 | Rare 1 | Epic 2 | Legendary 3. Every item also carries exactly
-/// one guaranteed PRIMARY affix on top of this count.
-pub const SECONDARY_COUNT_BY_RARITY: [u8; 4] = [0, 1, 2, 3];
+/// SECONDARY_COUNT_BY_RARITY (v4, spec §12.2):
+/// Common 0 | Rare 1 | Epic 2 | Legendary 3 | Mythic 4. Every item also carries
+/// exactly one guaranteed PRIMARY affix on top of this count.
+pub const SECONDARY_COUNT_BY_RARITY: [u8; 5] = [0, 1, 2, 3, 4];
 
-/// Max affixes an item may carry = 1 primary + 3 secondary (Legendary).
-/// Matches the on-chain account cap (spec §7).
-pub const MAX_AFFIXES: usize = 4;
+/// Max affixes an item may carry = 1 primary + 4 secondary (Mythic).
+/// Matches the on-chain account cap (spec §7/§12.2).
+pub const MAX_AFFIXES: usize = 5;
 
 // ---------------------------------------------------------------------------
 // PRIMARY_RANGE — guaranteed primary affix value ranges per kind (spec §10.2/§10.3).
@@ -294,15 +299,30 @@ impl RolledItem {
     }
 }
 
-/// Roll a full item from `seed` for the given `base_type` (spec §10.3).
+/// Roll a full item from `seed` for the given `base_type` (spec §10.3/§12.2).
 ///
 /// The RNG-draw order documented at the top of this module is part of the
 /// shared contract; do not reorder draws without bumping the golden vector.
+/// This is the CANONICAL path — it can roll up to Mythic and is used by the
+/// commit-reveal mint.
 pub fn roll_item(seed: u64, base_type: u8) -> RolledItem {
+    roll_item_capped(seed, base_type, RARITY_MYTHIC)
+}
+
+/// Roll an item but CLAMP the rolled rarity to at most `max_rarity` (spec §12.1).
+///
+/// The rarity `weighted_pick` draw is consumed identically to the canonical
+/// `roll_item` — only the resulting rarity id is saturated downward, so the
+/// jackpot (Mythic) can be fenced off from the 1-tx dev mint without changing
+/// the PRNG draw order of the rarity pick itself. Note the clamp DOES change the
+/// later draw count (tier / secondary_count differ once rarity is lowered); the
+/// capped path is intentionally a distinct, internally-consistent roll and is
+/// NOT covered by the canonical golden vector.
+pub fn roll_item_capped(seed: u64, base_type: u8, max_rarity: u8) -> RolledItem {
     let mut state = seed;
 
-    // 1. rarity
-    let rarity = weighted_pick(&mut state, &RARITY_WEIGHTS) as u8;
+    // 1. rarity (then clamp — see doc above).
+    let rarity = (weighted_pick(&mut state, &RARITY_WEIGHTS) as u8).min(max_rarity);
     // 2. tier (deterministic, no jitter)
     let tier = TIER_BY_RARITY[rarity as usize];
     let t = tier as i64;
@@ -389,6 +409,7 @@ pub fn rarity_name(rarity: u8) -> &'static str {
         RARITY_RARE => "Rare",
         RARITY_EPIC => "Epic",
         RARITY_LEGENDARY => "Legendary",
+        RARITY_MYTHIC => "Mythic",
         _ => "Unknown",
     }
 }
@@ -514,6 +535,81 @@ mod tests {
     }
 
     #[test]
+    fn rarity_ladder_is_consistent() {
+        // Five-rarity ladder; every pinned table is the same length and the
+        // weights sum to 1000 so Mythic is exactly 1/1000 (spec §12.2).
+        assert_eq!(RARITY_WEIGHTS.len(), 5);
+        assert_eq!(TIER_BY_RARITY.len(), 5);
+        assert_eq!(SECONDARY_COUNT_BY_RARITY.len(), 5);
+        assert_eq!(RARITY_WEIGHTS.iter().sum::<u32>(), 1000);
+        assert_eq!(RARITY_WEIGHTS[RARITY_MYTHIC as usize], 1);
+        assert_eq!(TIER_BY_RARITY[RARITY_MYTHIC as usize], 5);
+        assert_eq!(SECONDARY_COUNT_BY_RARITY[RARITY_MYTHIC as usize], 4);
+        // MAX_AFFIXES = 1 primary + the largest secondary count.
+        assert_eq!(
+            MAX_AFFIXES,
+            1 + *SECONDARY_COUNT_BY_RARITY.iter().max().unwrap() as usize
+        );
+        // Ladder is monotonic non-decreasing in tier + secondary count.
+        for r in 1..RARITY_WEIGHTS.len() {
+            assert!(TIER_BY_RARITY[r] >= TIER_BY_RARITY[r - 1]);
+            assert!(SECONDARY_COUNT_BY_RARITY[r] >= SECONDARY_COUNT_BY_RARITY[r - 1]);
+        }
+    }
+
+    #[test]
+    fn some_seed_rolls_mythic_and_is_outsized() {
+        // The 1/1000 god-roll must be reachable. Search crafted seeds until one
+        // yields Mythic (tier 5, 1 primary + up to 4 secondary). This both proves
+        // Mythic is live and pins its shape (spec §12.2).
+        let mut found: Option<(u64, RolledItem)> = None;
+        for seed in 0u64..200_000 {
+            let item = roll_item(seed, BASE_WEAPON);
+            if item.rarity == RARITY_MYTHIC {
+                found = Some((seed, item));
+                break;
+            }
+        }
+        let (seed, item) = found.expect("no Mythic found in 200k seeds — weights broken");
+        println!("Mythic seed={seed:#x} affixes={}", item.affixes.len());
+        assert_eq!(item.tier, 5, "Mythic must be tier 5");
+        assert_eq!(item.affixes[0].kind, KIND_FLAT_ATK, "weapon primary = FlatAtk");
+        // Mythic primary uses tier 5 ⇒ ×5 range (outsized).
+        let r = primary_range(KIND_FLAT_ATK);
+        let v = item.affixes[0].value as i64;
+        assert!(
+            v >= r.lo as i64 * 5 && v <= r.hi as i64 * 5,
+            "Mythic primary not in tier-5 range: {v}"
+        );
+        assert!(item.affixes.len() <= MAX_AFFIXES);
+    }
+
+    #[test]
+    fn capped_roll_never_exceeds_legendary() {
+        // The 1-tx dev mint clamps at Legendary so it can NEVER roll Mythic
+        // (spec §12.1). Sweep every seed that the uncapped roll makes Mythic and
+        // confirm the capped roll demotes it to Legendary.
+        let mut saw_demotion = false;
+        for seed in 0u64..200_000 {
+            let capped = roll_item_capped(seed, BASE_WEAPON, RARITY_LEGENDARY);
+            assert!(
+                capped.rarity <= RARITY_LEGENDARY,
+                "capped roll produced rarity {} (seed {seed})",
+                capped.rarity
+            );
+            assert!(capped.tier <= 4, "capped tier exceeded Legendary (seed {seed})");
+            if roll_item(seed, BASE_WEAPON).rarity == RARITY_MYTHIC {
+                assert_eq!(
+                    capped.rarity, RARITY_LEGENDARY,
+                    "a would-be Mythic must clamp to Legendary (seed {seed})"
+                );
+                saw_demotion = true;
+            }
+        }
+        assert!(saw_demotion, "test never exercised a Mythic demotion");
+    }
+
+    #[test]
     fn weapon_always_has_flat_atk_primary() {
         for seed in 0u64..4000 {
             let item = roll_item(seed, BASE_WEAPON);
@@ -543,7 +639,7 @@ mod tests {
             ));
         }
         format!(
-            "{{\n  \"version\": 2,\n  \"seed\": \"{:#018x}\",\n  \"base_type\": \"{}\",\n  \"rarity\": \"{}\",\n  \"rarity_id\": {},\n  \"tier\": {},\n  \"element\": \"{}\",\n  \"affixes\": [\n{}\n  ]\n}}\n",
+            "{{\n  \"version\": 4,\n  \"seed\": \"{:#018x}\",\n  \"base_type\": \"{}\",\n  \"rarity\": \"{}\",\n  \"rarity_id\": {},\n  \"tier\": {},\n  \"element\": \"{}\",\n  \"affixes\": [\n{}\n  ]\n}}\n",
             seed,
             base_type_name(item.base_type),
             rarity_name(item.rarity),
@@ -555,13 +651,13 @@ mod tests {
     }
 
     #[test]
-    fn golden_vector_v2_weapon() {
+    fn golden_vector_v4_weapon() {
         let item = roll_item(GOLDEN_SEED, BASE_WEAPON);
         let json = item_to_json(GOLDEN_SEED, &item);
 
-        // Write the shared v2 fixture the frontend track asserts against.
+        // Write the shared v4 fixture the frontend track asserts against.
         std::fs::write(GOLDEN_PATH, &json).expect("write golden vector fixture");
-        println!("golden vector v2 written to {GOLDEN_PATH}\n{json}");
+        println!("golden vector v4 written to {GOLDEN_PATH}\n{json}");
 
         // Stable invariants on the golden vector.
         assert_eq!(item.base_type, BASE_WEAPON);

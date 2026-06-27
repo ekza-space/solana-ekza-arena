@@ -77,6 +77,26 @@ describe("solana-ekza-arena", () => {
       program.programId
     )[0];
 
+  // v4 (spec §12.1): MintCommit PDA = [mint_commit, minter, nonce_le].
+  const mintCommitPda = (minter: anchor.web3.PublicKey, nonce: number) =>
+    anchor.web3.PublicKey.findProgramAddressSync(
+      [Buffer.from("mint_commit"), minter.toBuffer(), u64Bytes(nonce)],
+      program.programId
+    )[0];
+
+  // Treasury that receives the non-refundable commit fee (spec §12.1).
+  const treasury = anchor.web3.Keypair.generate();
+  const COMMIT_FEE_LAMPORTS = 10_000_000; // 0.01 SOL
+  let nextCommitNonce = Date.now();
+
+  const waitForSlotAfter = async (target: number) => {
+    for (;;) {
+      const slot = await provider.connection.getSlot();
+      if (slot > target) return slot;
+      await new Promise((r) => setTimeout(r, 200));
+    }
+  };
+
   const SLOT_HASHES_SYSVAR = new anchor.web3.PublicKey(
     "SysvarS1otHashes111111111111111111111111111"
   );
@@ -337,6 +357,28 @@ describe("solana-ekza-arena", () => {
   it("Is initialized!", async () => {
     const tx = await program.methods.initialize().rpc();
     expect(tx).to.be.a("string");
+  });
+
+  it("configures the registry treasury + commit fee (spec §12.1)", async () => {
+    await program.methods
+      .configureRegistry({
+        treasury: treasury.publicKey,
+        commitFeeLamports: new anchor.BN(COMMIT_FEE_LAMPORTS),
+      })
+      .accountsStrict({
+        registry: registryPda(),
+        payer: provider.wallet.publicKey,
+        systemProgram: anchor.web3.SystemProgram.programId,
+      })
+      .rpc();
+
+    const reg = await program.account.arenaRegistry.fetch(registryPda());
+    expect(reg.treasury.toBase58()).to.equal(treasury.publicKey.toBase58());
+    expect(reg.commitFeeLamports.toNumber()).to.equal(COMMIT_FEE_LAMPORTS);
+    console.log("E2E_PROOF registry_treasury=" + reg.treasury.toBase58());
+    console.log(
+      "E2E_PROOF registry_commit_fee_lamports=" + reg.commitFeeLamports.toString()
+    );
   });
 
   it("registers a direct Arena asset record", async () => {
@@ -698,6 +740,173 @@ describe("solana-ekza-arena", () => {
     expect(buyerLamportsAfter).to.be.greaterThan(buyerLamportsBefore);
 
     console.log("E2E_PROOF burned_and_closed_mint=" + mint.toBase58());
+  });
+
+  it("commit_mint charges the non-refundable fee to treasury + creates the MintCommit PDA (spec §12.1)", async () => {
+    const minter = provider.wallet.publicKey;
+    const nonce = nextCommitNonce++;
+    const commitPda = mintCommitPda(minter, nonce);
+
+    const payerBefore = await provider.connection.getBalance(minter);
+    const treasuryBefore = await provider.connection.getBalance(
+      treasury.publicKey
+    );
+
+    await program.methods
+      .commitMint({
+        nonce: new anchor.BN(nonce),
+        baseType: { weapon: {} },
+        skin: { builtin: [5] },
+        name: "Ekza Commit Weapon",
+        symbol: "EKZAITM",
+        uri: "https://meta.ekza.space/arena/commit-weapon.json",
+      })
+      .accountsStrict({
+        registry: registryPda(),
+        mintCommit: commitPda,
+        minter,
+        treasury: treasury.publicKey,
+        systemProgram: anchor.web3.SystemProgram.programId,
+      })
+      .rpc();
+
+    // Fee left the payer and arrived at the treasury, exactly.
+    const treasuryAfter = await provider.connection.getBalance(
+      treasury.publicKey
+    );
+    const payerAfter = await provider.connection.getBalance(minter);
+    expect(treasuryAfter - treasuryBefore).to.equal(COMMIT_FEE_LAMPORTS);
+    // Payer paid the fee + the commit-account rent + tx fee.
+    expect(payerBefore - payerAfter).to.be.greaterThan(COMMIT_FEE_LAMPORTS);
+
+    const commit = await program.account.mintCommit.fetch(commitPda);
+    expect(commit.minter.toBase58()).to.equal(minter.toBase58());
+    expect(commit.nonce.toNumber()).to.equal(nonce);
+    expect(commit.targetSlot.toNumber()).to.be.greaterThan(0);
+    expect(commit.baseType).to.deep.equal({ weapon: {} });
+
+    console.log("E2E_PROOF commit_pda=" + commitPda.toBase58());
+    console.log("E2E_PROOF commit_target_slot=" + commit.targetSlot.toString());
+    console.log(
+      "E2E_PROOF commit_fee_to_treasury=" + (treasuryAfter - treasuryBefore)
+    );
+  });
+
+  it("reveal_mint: rejected BEFORE target slot, then mints NFT + ArenaItem and closes the commit (spec §12.1)", async () => {
+    const minter = provider.wallet.publicKey;
+    const nonce = nextCommitNonce++;
+    const commitPda = mintCommitPda(minter, nonce);
+
+    await program.methods
+      .commitMint({
+        nonce: new anchor.BN(nonce),
+        baseType: { head: {} },
+        skin: { builtin: [9] },
+        name: "Ekza Reveal Head",
+        symbol: "EKZAITM",
+        uri: "https://meta.ekza.space/arena/reveal-head.json",
+      })
+      .accountsStrict({
+        registry: registryPda(),
+        mintCommit: commitPda,
+        minter,
+        treasury: treasury.publicKey,
+        systemProgram: anchor.web3.SystemProgram.programId,
+      })
+      .rpc();
+
+    const commit = await program.account.mintCommit.fetch(commitPda);
+    const targetSlot = commit.targetSlot.toNumber();
+
+    const mint = anchor.web3.Keypair.generate();
+    const ata = getAssociatedTokenAddressSync(mint.publicKey, minter);
+    const arenaItem = arenaItemPda(mint.publicKey);
+    const revealAccounts = {
+      registry: registryPda(),
+      mintCommit: commitPda,
+      mint: mint.publicKey,
+      arenaItem,
+      minterTokenAccount: ata,
+      minter,
+      slotHashes: SLOT_HASHES_SYSVAR,
+      metadataAccount: metadataPda(mint.publicKey),
+      masterEdition: masterEditionPda(mint.publicKey),
+      stellarProgram: null,
+      stellarRelease: null,
+      stellarVault: null,
+      tokenMetadataProgram: TOKEN_METADATA_PROGRAM_ID,
+      tokenProgram: TOKEN_PROGRAM_ID,
+      associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+      systemProgram: anchor.web3.SystemProgram.programId,
+      rent: anchor.web3.SYSVAR_RENT_PUBKEY,
+    };
+
+    // EARLY reveal (current slot still <= target) must be rejected. The 5-slot
+    // delay gives a comfortable window for this to land before the target.
+    let earlyRejected = false;
+    try {
+      await program.methods
+        .revealMint(new anchor.BN(nonce))
+        .accountsStrict(revealAccounts)
+        .signers([mint])
+        .rpc();
+    } catch (error) {
+      earlyRejected = true;
+      expect(String(error)).to.include("Reveal attempted before");
+    }
+    expect(earlyRejected).to.equal(true);
+    console.log("E2E_PROOF reveal_early_rejected=true target_slot=" + targetSlot);
+
+    // Advance past the target slot, then reveal succeeds (single-shot).
+    await waitForSlotAfter(targetSlot);
+    await program.methods
+      .revealMint(new anchor.BN(nonce))
+      .accountsStrict(revealAccounts)
+      .signers([mint])
+      .rpc();
+
+    // NFT minted (supply 1, decimals 0) and the minter holds it.
+    const mintInfo = await getMint(provider.connection, mint.publicKey);
+    expect(mintInfo.supply.toString()).to.equal("1");
+    expect(mintInfo.decimals).to.equal(0);
+    const ataInfo = await getAccount(provider.connection, ata);
+    expect(ataInfo.amount.toString()).to.equal("1");
+
+    // ArenaItem written with rolled stats + forward-compat defaults (spec §12.3).
+    const item = await program.account.arenaItem.fetch(arenaItem);
+    expect(item.mint.toBase58()).to.equal(mint.publicKey.toBase58());
+    expect(item.minter.toBase58()).to.equal(minter.toBase58());
+    expect(item.baseType).to.deep.equal({ head: {} });
+    expect(item.affixes.length).to.be.greaterThan(0);
+    expect(item.tier).to.be.greaterThan(0);
+    expect(item.enhanceLevel).to.equal(0);
+    expect(item.sockets.length).to.equal(0);
+
+    // Commit closed (rent → minter); single-shot.
+    const closed = await provider.connection.getAccountInfo(commitPda);
+    expect(closed).to.equal(null);
+
+    console.log("E2E_PROOF reveal_minted_nft=" + mint.publicKey.toBase58());
+    console.log("E2E_PROOF reveal_arena_item=" + arenaItem.toBase58());
+    console.log("E2E_PROOF reveal_commit_closed=" + commitPda.toBase58());
+  });
+
+  it("1-tx mint_arena_item NEVER rolls Mythic (clamped at Legendary) + writes forward-compat defaults (spec §12.1/§12.3)", async () => {
+    // The same-tx seed is revert-grindable, so the jackpot is fenced off: this
+    // path is hard-capped at Legendary. Sample several mints.
+    for (let i = 0; i < 6; i++) {
+      const { arenaItem } = await mintArenaItemNft({
+        baseType: { weapon: {} },
+        skin: { builtin: [1] },
+        name: "Ekza Clamp Weapon",
+      });
+      const item = await program.account.arenaItem.fetch(arenaItem);
+      expect(item.rarity).to.not.deep.equal({ mythic: {} });
+      expect(item.tier).to.be.lessThanOrEqual(4); // Legendary tier or below
+      expect(item.enhanceLevel).to.equal(0);
+      expect(item.sockets.length).to.equal(0);
+    }
+    console.log("E2E_PROOF mint_arena_item_clamped_never_mythic=true (6 samples)");
   });
 
   it("rejects Arena assets without an equip slot mask", async () => {

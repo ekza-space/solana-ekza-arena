@@ -17,18 +17,22 @@ pub enum ArenaRarity {
     Legendary,
     Unique,
     Epic,
+    /// v4 god-roll (~1/1000). Only the commit-reveal mint can produce it
+    /// (spec §12.2). The 1-tx dev mint is clamped below this.
+    Mythic,
 }
 
 impl ArenaRarity {
     pub const INIT_SPACE: usize = 1;
 
-    /// Map a raw affix-generator rarity id (spec §6 order) to the enum.
+    /// Map a raw affix-generator rarity id (spec §6/§12.2 order) to the enum.
     pub fn from_roll(rarity: u8) -> Self {
         match rarity {
             crate::affix::RARITY_COMMON => ArenaRarity::Common,
             crate::affix::RARITY_RARE => ArenaRarity::Rare,
             crate::affix::RARITY_EPIC => ArenaRarity::Epic,
             crate::affix::RARITY_LEGENDARY => ArenaRarity::Legendary,
+            crate::affix::RARITY_MYTHIC => ArenaRarity::Mythic,
             _ => ArenaRarity::Common,
         }
     }
@@ -142,11 +146,23 @@ impl MintArenaItemArgs {
 #[account]
 pub struct ArenaRegistry {
     pub next_index: u64,
+    /// Destination of the non-refundable commit fee (spec §12.1). Set by
+    /// `configure_registry`; default (all-zero) until configured.
+    pub treasury: Pubkey,
+    /// Non-refundable fee charged at `commit_mint`, in lamports (spec §12.1).
+    pub commit_fee_lamports: u64,
     pub bump: u8,
 }
 
 impl ArenaRegistry {
-    pub const INIT_SPACE: usize = 8 + 1;
+    pub const INIT_SPACE: usize = 8 + 32 + 8 + 1;
+}
+
+/// Args for `configure_registry` — set the treasury + commit fee (spec §12.1).
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ConfigureRegistryArgs {
+    pub treasury: Pubkey,
+    pub commit_fee_lamports: u64,
 }
 
 #[account]
@@ -236,6 +252,20 @@ impl ArenaAffix {
     pub const INIT_SPACE: usize = 1 + 2 + 1;
 }
 
+/// Forward-compat gem socket (spec §12.3/§4 of rng-economy-upgrades). Reserved
+/// now (defaulted empty at mint); the `socket_gem` instruction lands in v5.
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Socket {
+    pub kind: u8,
+    pub value: i16,
+}
+
+impl Socket {
+    pub const INIT_SPACE: usize = 1 + 2;
+    /// Max sockets reserved in `ArenaItem::INIT_SPACE` (spec §12.3).
+    pub const MAX_SOCKETS: usize = 3;
+}
+
 /// Skin source — purely cosmetic, carries zero balance impact (spec §2).
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug, PartialEq, Eq)]
 pub enum ItemSkin {
@@ -266,12 +296,19 @@ pub struct ArenaItem {
     /// seeded by this mint (spec §11.2).
     pub mint: Pubkey,
     pub index: u64,
+    /// Forward-compat (spec §12.3): sharpening level. Defaulted 0 at mint; no
+    /// instruction mutates it yet (v5 `sharpen_item`).
+    pub enhance_level: u8,
+    /// Forward-compat (spec §12.3): gem sockets. Defaulted empty at mint, space
+    /// reserved for MAX_SOCKETS; no instruction mutates it yet (v5 `socket_gem`).
+    pub sockets: Vec<Socket>,
     pub bump: u8,
 }
 
 impl ArenaItem {
     pub const MAX_AFFIXES: usize = crate::affix::MAX_AFFIXES;
     pub const AFFIXES_SPACE: usize = 4 + Self::MAX_AFFIXES * ArenaAffix::INIT_SPACE;
+    pub const SOCKETS_SPACE: usize = 4 + Socket::MAX_SOCKETS * Socket::INIT_SPACE;
     pub const INIT_SPACE: usize = 8 // seed
         + ArenaBaseType::INIT_SPACE
         + 1 // tier
@@ -281,6 +318,8 @@ impl ArenaItem {
         + 32 // minter
         + 32 // mint
         + 8 // index
+        + 1 // enhance_level
+        + Self::SOCKETS_SPACE
         + 1; // bump
 
     /// Derived view: fold the flat affixes into the legacy stat block so the
@@ -320,4 +359,55 @@ impl ArenaItem {
             _ => ArenaElement::None,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Commit-reveal mint (spec §12.1): the canonical, grind-resistant mint path.
+// ---------------------------------------------------------------------------
+
+/// Args for `commit_mint` (spec §12.1). The roll is NOT performed here — only
+/// the intent + future-slot lock is persisted; `reveal_mint` rolls from the
+/// then-unknown slot hash.
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug, PartialEq, Eq)]
+pub struct CommitMintArgs {
+    /// Caller-chosen nonce, part of the `MintCommit` PDA seeds (lets one minter
+    /// have many concurrent commits).
+    pub nonce: u64,
+    pub base_type: ArenaBaseType,
+    pub skin: MintSkinArg,
+    pub name: String,
+    pub symbol: String,
+    pub uri: String,
+}
+
+/// A pending mint, committed to a FUTURE slot (spec §12.1). `reveal_mint` reads
+/// the hash of `target_slot` (unknown at commit time) to derive the seed, making
+/// the roll unpredictable and thus revert-grind resistant.
+#[account]
+pub struct MintCommit {
+    pub minter: Pubkey,
+    pub nonce: u64,
+    /// Slot whose hash seeds the roll; reveal must wait until `Clock::slot` has
+    /// passed it AND the hash is still in the SlotHashes sysvar (~512 slots).
+    pub target_slot: u64,
+    pub base_type: ArenaBaseType,
+    pub skin: MintSkinArg,
+    pub name: String,
+    pub symbol: String,
+    pub uri: String,
+    pub bump: u8,
+}
+
+impl MintCommit {
+    /// Largest `MintSkinArg` payload: tag(1) + Ipfs(4 len + MAX_IPFS_LEN).
+    pub const SKIN_SPACE: usize = 1 + 4 + ItemSkin::MAX_IPFS_LEN;
+    pub const INIT_SPACE: usize = 32 // minter
+        + 8 // nonce
+        + 8 // target_slot
+        + ArenaBaseType::INIT_SPACE
+        + Self::SKIN_SPACE
+        + 4 + MintArenaItemArgs::MAX_NAME_LEN
+        + 4 + MintArenaItemArgs::MAX_SYMBOL_LEN
+        + 4 + MintArenaItemArgs::MAX_URI_LEN
+        + 1; // bump
 }

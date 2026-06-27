@@ -7,13 +7,14 @@ use anchor_spl::{
 
 use crate::{
     constants::{
-        ARENA_ASSET_SEED, ARENA_ITEM_SEED, REGISTRY_SEED, STELLAR_LINK_SEED,
+        ARENA_ASSET_SEED, ARENA_ITEM_SEED, MINT_COMMIT_SEED, REGISTRY_SEED, STELLAR_LINK_SEED,
         STELLAR_RELEASE_LINK_SEED,
     },
     error::ArenaRegistryError,
     state::{
-        ArenaAssetData, ArenaItem, ArenaRegistry, MintArenaItemArgs, RegisterArenaAssetArgs,
-        RegisterArenaAssetFromStellarArgs, StellarArenaAssetLink, StellarReleaseLink,
+        ArenaAssetData, ArenaItem, ArenaRegistry, CommitMintArgs, ConfigureRegistryArgs,
+        MintArenaItemArgs, MintCommit, RegisterArenaAssetArgs, RegisterArenaAssetFromStellarArgs,
+        StellarArenaAssetLink, StellarReleaseLink,
     },
 };
 
@@ -251,4 +252,151 @@ pub struct ScrapArenaItem<'info> {
 
     pub token_metadata_program: Program<'info, Metadata>,
     pub token_program: Program<'info, Token>,
+}
+
+/// Configure the registry's commit-reveal economics (spec §12.1): the treasury
+/// that receives the non-refundable commit fee, and the fee amount. Uses
+/// `init_if_needed` so the same registry PDA shared by the other instructions is
+/// created/updated; callable to (re)point the treasury or retune the fee.
+#[derive(Accounts)]
+#[instruction(args: ConfigureRegistryArgs)]
+pub struct ConfigureRegistry<'info> {
+    #[account(
+        init_if_needed,
+        payer = payer,
+        space = 8 + ArenaRegistry::INIT_SPACE,
+        seeds = [REGISTRY_SEED],
+        bump
+    )]
+    pub registry: Account<'info, ArenaRegistry>,
+
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+/// `commit_mint` (spec §12.1): lock a FUTURE slot + charge the non-refundable
+/// commit fee. No roll happens here — that is `reveal_mint`'s job, seeded by the
+/// then-unknown `target_slot` hash (revert-grind resistant).
+#[derive(Accounts)]
+#[instruction(args: CommitMintArgs)]
+pub struct CommitMint<'info> {
+    #[account(
+        mut,
+        seeds = [REGISTRY_SEED],
+        bump
+    )]
+    pub registry: Account<'info, ArenaRegistry>,
+
+    #[account(
+        init,
+        payer = minter,
+        space = 8 + MintCommit::INIT_SPACE,
+        seeds = [MINT_COMMIT_SEED, minter.key().as_ref(), &args.nonce.to_le_bytes()],
+        bump
+    )]
+    pub mint_commit: Account<'info, MintCommit>,
+
+    #[account(mut)]
+    pub minter: Signer<'info>,
+
+    /// CHECK: Treasury that receives the commit fee; must equal the configured
+    /// `registry.treasury` (enforced in the handler).
+    #[account(mut)]
+    pub treasury: UncheckedAccount<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+/// `reveal_mint` (spec §12.1): roll from the committed slot's hash, mint the NFT
+/// (spec §11), write `ArenaItem`, and close the `MintCommit` (rent → minter).
+/// This is the ONLY path that can roll Mythic. Single-shot.
+#[derive(Accounts)]
+#[instruction(nonce: u64)]
+pub struct RevealMint<'info> {
+    #[account(
+        mut,
+        seeds = [REGISTRY_SEED],
+        bump
+    )]
+    pub registry: Account<'info, ArenaRegistry>,
+
+    /// The pending commit; closed here, rent returns to the minter.
+    #[account(
+        mut,
+        close = minter,
+        has_one = minter,
+        seeds = [MINT_COMMIT_SEED, minter.key().as_ref(), &nonce.to_le_bytes()],
+        bump = mint_commit.bump,
+    )]
+    pub mint_commit: Account<'info, MintCommit>,
+
+    /// The new NFT mint (1 token, 0 decimals).
+    #[account(
+        init,
+        payer = minter,
+        mint::decimals = 0,
+        mint::authority = minter,
+        mint::freeze_authority = minter
+    )]
+    pub mint: Account<'info, Mint>,
+
+    /// Game stats PDA, seeded by the NFT mint (spec §11.2).
+    #[account(
+        init,
+        payer = minter,
+        space = 8 + ArenaItem::INIT_SPACE,
+        seeds = [ARENA_ITEM_SEED, mint.key().as_ref()],
+        bump
+    )]
+    pub arena_item: Account<'info, ArenaItem>,
+
+    /// Minter's associated token account — receives the single NFT token.
+    #[account(
+        init,
+        payer = minter,
+        associated_token::mint = mint,
+        associated_token::authority = minter
+    )]
+    pub minter_token_account: Account<'info, TokenAccount>,
+
+    #[account(mut)]
+    pub minter: Signer<'info>,
+
+    /// CHECK: Address-constrained to the SlotHashes sysvar; read as raw data.
+    #[account(address = anchor_lang::solana_program::sysvar::slot_hashes::ID)]
+    pub slot_hashes: AccountInfo<'info>,
+
+    /// CHECK: Metaplex metadata account PDA for this mint (created via CPI).
+    #[account(
+        mut,
+        seeds = [b"metadata", token_metadata_program.key().as_ref(), mint.key().as_ref()],
+        bump,
+        seeds::program = token_metadata_program.key()
+    )]
+    pub metadata_account: UncheckedAccount<'info>,
+
+    /// CHECK: Metaplex master edition PDA for this mint (created via CPI).
+    #[account(
+        mut,
+        seeds = [b"metadata", token_metadata_program.key().as_ref(), mint.key().as_ref(), b"edition"],
+        bump,
+        seeds::program = token_metadata_program.key()
+    )]
+    pub master_edition: UncheckedAccount<'info>,
+
+    // Optional Stellar accounts — required only when the committed `skin == Stellar`.
+    /// CHECK: Validated by owner, executable bit, and fixed program id.
+    pub stellar_program: Option<AccountInfo<'info>>,
+    /// CHECK: Validated as a solana-stellar Release account by fixed-layout fields.
+    pub stellar_release: Option<AccountInfo<'info>>,
+    /// CHECK: Validated against the vault stored in the Stellar release account.
+    pub stellar_vault: Option<AccountInfo<'info>>,
+
+    pub token_metadata_program: Program<'info, Metadata>,
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, System>,
+    pub rent: Sysvar<'info, Rent>,
 }

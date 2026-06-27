@@ -47,6 +47,25 @@ pub mod solana_ekza_arena {
     pub fn scrap_arena_item(ctx: Context<ScrapArenaItem>) -> Result<()> {
         handlers::scrap_arena_item(ctx)
     }
+
+    /// Set the treasury + commit fee for the commit-reveal mint (spec §12.1).
+    pub fn configure_registry(
+        ctx: Context<ConfigureRegistry>,
+        args: ConfigureRegistryArgs,
+    ) -> Result<()> {
+        handlers::configure_registry(ctx, args)
+    }
+
+    /// Commit-reveal mint — step 1: lock a future slot + charge the fee (§12.1).
+    pub fn commit_mint(ctx: Context<CommitMint>, args: CommitMintArgs) -> Result<()> {
+        handlers::commit_mint(ctx, args)
+    }
+
+    /// Commit-reveal mint — step 2: roll from the slot hash + mint (§12.1).
+    /// `nonce` re-derives the `MintCommit` PDA.
+    pub fn reveal_mint(ctx: Context<RevealMint>, nonce: u64) -> Result<()> {
+        handlers::reveal_mint(ctx, nonce)
+    }
 }
 
 #[derive(Accounts)]

@@ -7,6 +7,11 @@ skip-lint = false
 
 [programs.localnet]
 solana_ekza_arena = "D3a99Wj3eLLn4jbXU5rLDbaFT6giQiUbmcPkiyQSM8iZ"
+solana_stellar = "3rVXfq7LLSLqbDzvZuSrQoMytwczLj2Q8Hue62rxPZAA"
+
+[[test.genesis]]
+address = "3rVXfq7LLSLqbDzvZuSrQoMytwczLj2Q8Hue62rxPZAA"
+program = "../solana-stellar/target/deploy/solana_stellar.so"
 
 [registry]
 url = "https://api.apr.dev"

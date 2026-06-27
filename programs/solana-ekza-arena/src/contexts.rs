@@ -1,4 +1,9 @@
 use anchor_lang::prelude::*;
+use anchor_spl::{
+    associated_token::AssociatedToken,
+    metadata::Metadata,
+    token::{Mint, Token, TokenAccount},
+};
 
 use crate::{
     constants::{
@@ -103,6 +108,12 @@ pub struct RegisterArenaAssetFromStellar<'info> {
     pub system_program: Program<'info, System>,
 }
 
+/// Mint a rolled Arena item as a REAL tradeable Metaplex NFT (spec §11).
+///
+/// The `arena_item` PDA is re-seeded by the **NFT mint pubkey** (1:1 mint↔item)
+/// and holds the immutable rolled stats — the game's source of truth. The SPL
+/// mint (supply 1, decimals 0) + Master Edition (max supply 0) make it a true
+/// non-fungible that any Solana marketplace can trade.
 #[derive(Accounts)]
 #[instruction(args: MintArenaItemArgs)]
 pub struct MintArenaItem<'info> {
@@ -115,17 +126,35 @@ pub struct MintArenaItem<'info> {
     )]
     pub registry: Account<'info, ArenaRegistry>,
 
+    /// The new NFT mint (1 token, 0 decimals). Mint+freeze authority start on the
+    /// payer; the Master Edition CPI then takes them over.
+    #[account(
+        init,
+        payer = payer,
+        mint::decimals = 0,
+        mint::authority = payer,
+        mint::freeze_authority = payer
+    )]
+    pub mint: Account<'info, Mint>,
+
+    /// Game stats PDA, seeded by the NFT mint (spec §11.2).
     #[account(
         init,
         payer = payer,
         space = 8 + ArenaItem::INIT_SPACE,
-        seeds = [
-            ARENA_ITEM_SEED,
-            &registry.next_index.to_le_bytes()
-        ],
+        seeds = [ARENA_ITEM_SEED, mint.key().as_ref()],
         bump
     )]
     pub arena_item: Account<'info, ArenaItem>,
+
+    /// Minter's associated token account — receives the single NFT token.
+    #[account(
+        init,
+        payer = payer,
+        associated_token::mint = mint,
+        associated_token::authority = payer
+    )]
+    pub minter_token_account: Account<'info, TokenAccount>,
 
     #[account(mut)]
     pub payer: Signer<'info>,
@@ -133,6 +162,24 @@ pub struct MintArenaItem<'info> {
     /// CHECK: Address-constrained to the SlotHashes sysvar; read as raw data.
     #[account(address = anchor_lang::solana_program::sysvar::slot_hashes::ID)]
     pub slot_hashes: AccountInfo<'info>,
+
+    /// CHECK: Metaplex metadata account PDA for this mint (created via CPI).
+    #[account(
+        mut,
+        seeds = [b"metadata", token_metadata_program.key().as_ref(), mint.key().as_ref()],
+        bump,
+        seeds::program = token_metadata_program.key()
+    )]
+    pub metadata_account: UncheckedAccount<'info>,
+
+    /// CHECK: Metaplex master edition PDA for this mint (created via CPI).
+    #[account(
+        mut,
+        seeds = [b"metadata", token_metadata_program.key().as_ref(), mint.key().as_ref(), b"edition"],
+        bump,
+        seeds::program = token_metadata_program.key()
+    )]
+    pub master_edition: UncheckedAccount<'info>,
 
     // Optional Stellar accounts — required only when `skin == Stellar`.
     /// CHECK: Validated by owner, executable bit, and fixed program id.
@@ -142,23 +189,66 @@ pub struct MintArenaItem<'info> {
     /// CHECK: Validated against the vault stored in the Stellar release account.
     pub stellar_vault: Option<AccountInfo<'info>>,
 
+    pub token_metadata_program: Program<'info, Metadata>,
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, System>,
+    pub rent: Sysvar<'info, Rent>,
 }
 
-/// Scrap (close) a rolled `ArenaItem` — the v2 economic SINK (spec §10.5).
+/// Scrap a rolled item — the economic SINK (spec §10.5/§11.3). BURNS the NFT
+/// (token + metadata + master edition via Metaplex `BurnNft`) AND closes the
+/// `ArenaItem` PDA, returning all rent to the current owner.
 ///
-/// `close = minter` returns the account's rent lamports to the owner. The
-/// `has_one = minter` guard ties the stored `ArenaItem.minter` to the signer,
-/// so ONLY the item owner may scrap it (anyone else => Unauthorized).
+/// Ownership is the **NFT token holder** (spec §11.2), not `minter`: the signer
+/// must hold the single token in `token_account`. `BurnNft` enforces this (it
+/// fails unless `owner` signs and owns the token); the `amount == 1` constraint
+/// gives a clean error first.
 #[derive(Accounts)]
 pub struct ScrapArenaItem<'info> {
     #[account(
         mut,
-        close = minter,
-        has_one = minter @ ArenaRegistryError::Unauthorized,
+        close = owner,
+        has_one = mint,
+        seeds = [ARENA_ITEM_SEED, mint.key().as_ref()],
+        bump = arena_item.bump,
     )]
     pub arena_item: Account<'info, ArenaItem>,
 
+    /// The NFT mint bound to this item.
     #[account(mut)]
-    pub minter: Signer<'info>,
+    pub mint: Account<'info, Mint>,
+
+    /// Owner's token account — must hold exactly the 1 NFT token.
+    #[account(
+        mut,
+        associated_token::mint = mint,
+        associated_token::authority = owner,
+        constraint = token_account.amount == 1 @ ArenaRegistryError::NotNftHolder,
+    )]
+    pub token_account: Account<'info, TokenAccount>,
+
+    /// CHECK: Metaplex metadata PDA, closed by the `BurnNft` CPI.
+    #[account(
+        mut,
+        seeds = [b"metadata", token_metadata_program.key().as_ref(), mint.key().as_ref()],
+        bump,
+        seeds::program = token_metadata_program.key()
+    )]
+    pub metadata_account: UncheckedAccount<'info>,
+
+    /// CHECK: Metaplex master edition PDA, closed by the `BurnNft` CPI.
+    #[account(
+        mut,
+        seeds = [b"metadata", token_metadata_program.key().as_ref(), mint.key().as_ref(), b"edition"],
+        bump,
+        seeds::program = token_metadata_program.key()
+    )]
+    pub master_edition: UncheckedAccount<'info>,
+
+    #[account(mut)]
+    pub owner: Signer<'info>,
+
+    pub token_metadata_program: Program<'info, Metadata>,
+    pub token_program: Program<'info, Token>,
 }

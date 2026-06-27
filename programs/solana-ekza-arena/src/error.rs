@@ -30,4 +30,8 @@ pub enum ArenaRegistryError {
     MissingStellarSkinAccounts,
     #[msg("Invalid SlotHashes sysvar account.")]
     InvalidSlotHashes,
+    #[msg("Invalid NFT metadata (name/symbol/uri length).")]
+    InvalidNftMetadata,
+    #[msg("The signer is not the current holder of the item NFT.")]
+    NotNftHolder,
 }

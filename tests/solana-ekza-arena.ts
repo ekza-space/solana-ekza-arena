@@ -1,12 +1,47 @@
 import * as anchor from "@coral-xyz/anchor";
 import { Program } from "@coral-xyz/anchor";
 import { expect } from "chai";
+import {
+  ASSOCIATED_TOKEN_PROGRAM_ID,
+  TOKEN_PROGRAM_ID,
+  getAssociatedTokenAddressSync,
+  getAccount,
+  getMint,
+  createAssociatedTokenAccountInstruction,
+  createTransferInstruction,
+} from "@solana/spl-token";
 import { SolanaEkzaArena } from "../target/types/solana_ekza_arena";
 import stellarIdl from "../../solana-stellar/target/idl/solana_stellar.json";
 
 const STELLAR_PROGRAM_ID = new anchor.web3.PublicKey(
   "3rVXfq7LLSLqbDzvZuSrQoMytwczLj2Q8Hue62rxPZAA"
 );
+
+// Metaplex Token Metadata (cloned on localnet / genesis in anchor test).
+const TOKEN_METADATA_PROGRAM_ID = new anchor.web3.PublicKey(
+  "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s"
+);
+
+const metadataPda = (mint: anchor.web3.PublicKey) =>
+  anchor.web3.PublicKey.findProgramAddressSync(
+    [
+      Buffer.from("metadata"),
+      TOKEN_METADATA_PROGRAM_ID.toBuffer(),
+      mint.toBuffer(),
+    ],
+    TOKEN_METADATA_PROGRAM_ID
+  )[0];
+
+const masterEditionPda = (mint: anchor.web3.PublicKey) =>
+  anchor.web3.PublicKey.findProgramAddressSync(
+    [
+      Buffer.from("metadata"),
+      TOKEN_METADATA_PROGRAM_ID.toBuffer(),
+      mint.toBuffer(),
+      Buffer.from("edition"),
+    ],
+    TOKEN_METADATA_PROGRAM_ID
+  )[0];
 
 describe("solana-ekza-arena", () => {
   anchor.setProvider(anchor.AnchorProvider.env());
@@ -35,9 +70,10 @@ describe("solana-ekza-arena", () => {
       program.programId
     )[0];
 
-  const arenaItemPda = (index: number) =>
+  // v3 (spec §11.2): ArenaItem PDA is seeded by the NFT mint pubkey (1:1).
+  const arenaItemPda = (mint: anchor.web3.PublicKey) =>
     anchor.web3.PublicKey.findProgramAddressSync(
-      [Buffer.from("arena_item_v1"), u64Bytes(index)],
+      [Buffer.from("arena_item_v1"), mint.toBuffer()],
       program.programId
     )[0];
 
@@ -247,6 +283,57 @@ describe("solana-ekza-arena", () => {
     return { universe, asset, release, vault };
   }
 
+  // Mint a real, tradeable item NFT (spec §11). Generates a fresh mint keypair,
+  // wires the full Metaplex account set, and returns everything the asserts need.
+  async function mintArenaItemNft(opts: {
+    baseType: any;
+    skin: any;
+    name?: string;
+    symbol?: string;
+    uri?: string;
+    stellar?: {
+      program: anchor.web3.PublicKey;
+      release: anchor.web3.PublicKey;
+      vault: anchor.web3.PublicKey;
+    };
+  }) {
+    const mint = anchor.web3.Keypair.generate();
+    const payer = provider.wallet.publicKey;
+    const ata = getAssociatedTokenAddressSync(mint.publicKey, payer);
+    const arenaItem = arenaItemPda(mint.publicKey);
+
+    await program.methods
+      .mintArenaItem({
+        baseType: opts.baseType,
+        skin: opts.skin,
+        name: opts.name ?? "Ekza Arena Item",
+        symbol: opts.symbol ?? "EKZAITM",
+        uri: opts.uri ?? "https://meta.ekza.space/arena/item.json",
+      })
+      .accountsStrict({
+        registry: registryPda(),
+        mint: mint.publicKey,
+        arenaItem,
+        minterTokenAccount: ata,
+        payer,
+        slotHashes: SLOT_HASHES_SYSVAR,
+        metadataAccount: metadataPda(mint.publicKey),
+        masterEdition: masterEditionPda(mint.publicKey),
+        stellarProgram: opts.stellar ? opts.stellar.program : null,
+        stellarRelease: opts.stellar ? opts.stellar.release : null,
+        stellarVault: opts.stellar ? opts.stellar.vault : null,
+        tokenMetadataProgram: TOKEN_METADATA_PROGRAM_ID,
+        tokenProgram: TOKEN_PROGRAM_ID,
+        associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+        systemProgram: anchor.web3.SystemProgram.programId,
+        rent: anchor.web3.SYSVAR_RENT_PUBKEY,
+      })
+      .signers([mint])
+      .rpc();
+
+    return { mint: mint.publicKey, ata, arenaItem };
+  }
+
   it("Is initialized!", async () => {
     const tx = await program.methods.initialize().rpc();
     expect(tx).to.be.a("string");
@@ -391,43 +478,54 @@ describe("solana-ekza-arena", () => {
     );
   });
 
-  it("mints a deterministic Arena item with rolled affixes (builtin skin)", async () => {
-    const registry = registryPda();
+  it("mints a real tradeable item NFT with rolled affixes (builtin skin, spec §11)", async () => {
     const index = await nextArenaAssetIndex();
-    const arenaItem = arenaItemPda(index);
+    const { mint, ata, arenaItem } = await mintArenaItemNft({
+      baseType: { weapon: {} },
+      skin: { builtin: [7] },
+      name: "Ekza Weapon #1",
+      uri: "https://meta.ekza.space/arena/weapon-1.json",
+    });
 
-    await program.methods
-      .mintArenaItem({
-        baseType: { weapon: {} },
-        skin: { builtin: [7] },
-      })
-      .accountsStrict({
-        registry,
-        arenaItem,
-        payer: provider.wallet.publicKey,
-        slotHashes: SLOT_HASHES_SYSVAR,
-        stellarProgram: null,
-        stellarRelease: null,
-        stellarVault: null,
-        systemProgram: anchor.web3.SystemProgram.programId,
-      })
-      .rpc();
+    console.log("E2E_PROOF minted_nft_mint=" + mint.toBase58());
 
+    // SPL mint: supply == 1, decimals == 0 (true non-fungible).
+    const mintInfo = await getMint(provider.connection, mint);
+    expect(mintInfo.supply.toString()).to.equal("1");
+    expect(mintInfo.decimals).to.equal(0);
+
+    // Minter ATA holds exactly the 1 token.
+    const ataInfo = await getAccount(provider.connection, ata);
+    expect(ataInfo.amount.toString()).to.equal("1");
+    expect(ataInfo.owner.equals(provider.wallet.publicKey)).to.equal(true);
+
+    // Metadata account exists with the supplied name/uri.
+    const metaInfo = await provider.connection.getAccountInfo(metadataPda(mint));
+    expect(metaInfo).to.not.equal(null);
+    expect(metaInfo!.owner.equals(TOKEN_METADATA_PROGRAM_ID)).to.equal(true);
+    const metaStr = metaInfo!.data.toString("utf8");
+    expect(metaStr).to.include("Ekza Weapon #1");
+    expect(metaStr).to.include("weapon-1.json");
+
+    // Master Edition exists (true 1-of-1 non-fungible).
+    const meInfo = await provider.connection.getAccountInfo(
+      masterEditionPda(mint)
+    );
+    expect(meInfo).to.not.equal(null);
+    expect(meInfo!.owner.equals(TOKEN_METADATA_PROGRAM_ID)).to.equal(true);
+
+    // ArenaItem PDA (seeded by mint) carries the rolled stats + the mint.
     const itemAccount = await program.account.arenaItem.fetch(arenaItem);
-
-    // Account created with sane fields.
     expect(itemAccount.index.toNumber()).to.equal(index);
     expect(itemAccount.minter.equals(provider.wallet.publicKey)).to.equal(true);
+    expect(itemAccount.mint.equals(mint)).to.equal(true);
     expect(itemAccount.baseType).to.deep.equal({ weapon: {} });
     expect(itemAccount.skinRef).to.deep.equal({ builtin: { "0": 7 } });
-    // seed is non-zero entropy off the slothash.
     expect(itemAccount.seed.toString()).to.not.equal("0");
-    // tier in [1..4], at least one affix, at most the legendary cap of 4.
     expect(itemAccount.tier).to.be.greaterThan(0);
     expect(itemAccount.tier).to.be.lessThan(5);
     expect(itemAccount.affixes.length).to.be.greaterThan(0);
     expect(itemAccount.affixes.length).to.be.lessThan(5);
-    // every affix value is positive and kind is a valid id (0..8).
     for (const affix of itemAccount.affixes) {
       expect(affix.value).to.be.greaterThan(0);
       expect(affix.kind).to.be.greaterThan(-1);
@@ -435,112 +533,171 @@ describe("solana-ekza-arena", () => {
     }
   });
 
-  it("rejects minting an item with an out-of-range builtin skin id", async () => {
-    const registry = registryPda();
-    const index = await nextArenaAssetIndex();
-    const arenaItem = arenaItemPda(index);
+  it("mints an item NFT from a Stellar skin (skin_ref == StellarAsset, spec §11.2)", async () => {
+    const stellar = await createFinalizedStellarRelease("ArenaNftSkin");
 
+    const { mint, ata, arenaItem } = await mintArenaItemNft({
+      baseType: { armor: {} },
+      skin: { stellar: {} },
+      name: "Ekza Stellar Armor",
+      stellar: {
+        program: STELLAR_PROGRAM_ID,
+        release: stellar.release,
+        vault: stellar.vault,
+      },
+    });
+
+    console.log("E2E_PROOF stellar_skin_nft_mint=" + mint.toBase58());
+    console.log(
+      "E2E_PROOF stellar_skin_asset=" + stellar.asset.toBase58()
+    );
+
+    // NFT really minted with stats.
+    const mintInfo = await getMint(provider.connection, mint);
+    expect(mintInfo.supply.toString()).to.equal("1");
+    const ataInfo = await getAccount(provider.connection, ata);
+    expect(ataInfo.amount.toString()).to.equal("1");
+
+    const itemAccount = await program.account.arenaItem.fetch(arenaItem);
+    // skin_ref points at the validated Stellar asset pubkey.
+    expect(itemAccount.skinRef.stellarAsset).to.not.equal(undefined);
+    expect(itemAccount.skinRef.stellarAsset[0].toBase58()).to.equal(
+      stellar.asset.toBase58()
+    );
+    // And it carries the rolled stats.
+    expect(itemAccount.affixes.length).to.be.greaterThan(0);
+    expect(itemAccount.tier).to.be.greaterThan(0);
+    expect(itemAccount.mint.equals(mint)).to.equal(true);
+  });
+
+  it("rejects minting an item with an out-of-range builtin skin id", async () => {
     try {
-      await program.methods
-        .mintArenaItem({
-          baseType: { charm: {} },
-          skin: { builtin: [200] }, // >= MAX_BUILTIN_SKINS (64)
-        })
-        .accountsStrict({
-          registry,
-          arenaItem,
-          payer: provider.wallet.publicKey,
-          slotHashes: SLOT_HASHES_SYSVAR,
-          stellarProgram: null,
-          stellarRelease: null,
-          stellarVault: null,
-          systemProgram: anchor.web3.SystemProgram.programId,
-        })
-        .rpc();
+      await mintArenaItemNft({
+        baseType: { charm: {} },
+        skin: { builtin: [200] }, // >= MAX_BUILTIN_SKINS (64)
+      });
       expect.fail("mintArenaItem should reject an out-of-range builtin skin id");
     } catch (error) {
       expect(String(error)).to.include("Invalid item skin reference");
     }
   });
 
-  async function mintItem(baseType: any) {
-    const registry = registryPda();
-    const index = await nextArenaAssetIndex();
-    const arenaItem = arenaItemPda(index);
+  it("TRADEABILITY: transfers the item NFT to a second wallet then scraps by the new owner (spec §11.3/§11.5)", async () => {
+    // Mint an item NFT to wallet #1 (the provider wallet).
+    const { mint, ata, arenaItem } = await mintArenaItemNft({
+      baseType: { head: {} },
+      skin: { builtin: [3] },
+      name: "Ekza Tradeable Head",
+    });
 
-    await program.methods
-      .mintArenaItem({ baseType, skin: { builtin: [3] } })
-      .accountsStrict({
-        registry,
-        arenaItem,
-        payer: provider.wallet.publicKey,
-        slotHashes: SLOT_HASHES_SYSVAR,
-        stellarProgram: null,
-        stellarRelease: null,
-        stellarVault: null,
-        systemProgram: anchor.web3.SystemProgram.programId,
-      })
-      .rpc();
-
-    return { index, arenaItem };
-  }
-
-  it("scraps a minted Arena item and closes the account (owner, spec §10.5)", async () => {
-    const { arenaItem } = await mintItem({ head: {} });
-
-    // Account exists before scrap.
-    const before = await program.account.arenaItem.fetch(arenaItem);
-    expect(before.minter.equals(provider.wallet.publicKey)).to.equal(true);
-
-    await program.methods
-      .scrapArenaItem()
-      .accountsStrict({
-        arenaItem,
-        minter: provider.wallet.publicKey,
-      })
-      .rpc();
-
-    // Account closed: the on-chain account is gone (rent returned to owner).
-    const closed = await provider.connection.getAccountInfo(arenaItem);
-    expect(closed).to.equal(null);
-
-    let fetchThrew = false;
-    try {
-      await program.account.arenaItem.fetch(arenaItem);
-    } catch {
-      fetchThrew = true;
-    }
-    expect(fetchThrew).to.equal(true);
-  });
-
-  it("rejects scrapping an Arena item by a non-owner", async () => {
-    const { arenaItem } = await mintItem({ armor: {} });
-
-    const attacker = anchor.web3.Keypair.generate();
-    const sig = await provider.connection.requestAirdrop(
-      attacker.publicKey,
+    // Second wallet (the buyer).
+    const buyer = anchor.web3.Keypair.generate();
+    const air = await provider.connection.requestAirdrop(
+      buyer.publicKey,
       anchor.web3.LAMPORTS_PER_SOL
     );
-    await provider.connection.confirmTransaction(sig);
+    await provider.connection.confirmTransaction(air);
+    const buyerAta = getAssociatedTokenAddressSync(mint, buyer.publicKey);
 
+    // Standard SPL transfer: wallet #1 -> wallet #2.
+    const tx = new anchor.web3.Transaction()
+      .add(
+        createAssociatedTokenAccountInstruction(
+          provider.wallet.publicKey, // payer
+          buyerAta,
+          buyer.publicKey, // owner
+          mint
+        )
+      )
+      .add(
+        createTransferInstruction(
+          ata, // source
+          buyerAta, // destination
+          provider.wallet.publicKey, // authority
+          1
+        )
+      );
+    await provider.sendAndConfirm(tx, []);
+
+    // New wallet now holds the NFT; the first wallet is empty.
+    const oldInfo = await getAccount(provider.connection, ata);
+    const newInfo = await getAccount(provider.connection, buyerAta);
+    expect(oldInfo.amount.toString()).to.equal("0");
+    expect(newInfo.amount.toString()).to.equal("1");
+    expect(newInfo.owner.equals(buyer.publicKey)).to.equal(true);
+
+    console.log("E2E_PROOF transfer_old_owner=" + provider.wallet.publicKey.toBase58());
+    console.log("E2E_PROOF transfer_new_owner=" + buyer.publicKey.toBase58());
+    console.log("E2E_PROOF transfer_mint=" + mint.toBase58());
+
+    // The original minter can NO LONGER scrap — they are not the holder.
+    let oldOwnerRejected = false;
     try {
       await program.methods
         .scrapArenaItem()
         .accountsStrict({
           arenaItem,
-          minter: attacker.publicKey,
+          mint,
+          tokenAccount: ata, // empty account of the old owner
+          metadataAccount: metadataPda(mint),
+          masterEdition: masterEditionPda(mint),
+          owner: provider.wallet.publicKey,
+          tokenMetadataProgram: TOKEN_METADATA_PROGRAM_ID,
+          tokenProgram: TOKEN_PROGRAM_ID,
         })
-        .signers([attacker])
         .rpc();
-      expect.fail("scrapArenaItem should reject a non-owner signer");
-    } catch (error) {
-      // has_one = minter @ Unauthorized guards ownership.
-      expect(String(error)).to.match(/Unauthorized|has one|ConstraintHasOne/i);
+    } catch {
+      oldOwnerRejected = true;
     }
+    expect(oldOwnerRejected).to.equal(true);
 
-    // The item must still exist after a rejected scrap.
-    const still = await program.account.arenaItem.fetch(arenaItem);
-    expect(still.minter.equals(provider.wallet.publicKey)).to.equal(true);
+    // Now the NEW owner scraps: burns the NFT + closes the ArenaItem PDA.
+    const buyerLamportsBefore = await provider.connection.getBalance(
+      buyer.publicKey
+    );
+
+    await program.methods
+      .scrapArenaItem()
+      .accountsStrict({
+        arenaItem,
+        mint,
+        tokenAccount: buyerAta,
+        metadataAccount: metadataPda(mint),
+        masterEdition: masterEditionPda(mint),
+        owner: buyer.publicKey,
+        tokenMetadataProgram: TOKEN_METADATA_PROGRAM_ID,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      })
+      .signers([buyer])
+      .rpc();
+
+    // NFT burned: the holder's token account is closed and the mint supply is 0.
+    const burnedToken = await provider.connection.getAccountInfo(buyerAta);
+    expect(burnedToken).to.equal(null);
+    const burnedMint = await getMint(provider.connection, mint);
+    expect(burnedMint.supply.toString()).to.equal("0");
+
+    // Metadata + master edition are torn down by Metaplex `BurnNft`: the master
+    // edition account is fully closed (null) and the metadata account is drained
+    // to a 1-byte `Key::Uninitialized` husk — neither is a live NFT account.
+    const burnedMeta = await provider.connection.getAccountInfo(
+      metadataPda(mint)
+    );
+    const burnedEdition = await provider.connection.getAccountInfo(
+      masterEditionPda(mint)
+    );
+    expect(burnedEdition).to.equal(null);
+    expect(burnedMeta === null || burnedMeta.data.length <= 1).to.equal(true);
+
+    // ArenaItem PDA closed, rent returned to the new owner.
+    const closedItem = await provider.connection.getAccountInfo(arenaItem);
+    expect(closedItem).to.equal(null);
+    const buyerLamportsAfter = await provider.connection.getBalance(
+      buyer.publicKey
+    );
+    expect(buyerLamportsAfter).to.be.greaterThan(buyerLamportsBefore);
+
+    console.log("E2E_PROOF burned_and_closed_mint=" + mint.toBase58());
   });
 
   it("rejects Arena assets without an equip slot mask", async () => {

@@ -124,6 +124,19 @@ pub enum MintSkinArg {
 pub struct MintArenaItemArgs {
     pub base_type: ArenaBaseType,
     pub skin: MintSkinArg,
+    /// NFT Metadata `name` (e.g. "Ekza Arena Item #12"). Client builds it.
+    pub name: String,
+    /// NFT Metadata `symbol` (e.g. "EKZAITEM").
+    pub symbol: String,
+    /// Off-chain metadata JSON URI (skin image/animation + stats mirror, spec
+    /// §11.2). Client uploads to IPFS and passes the gateway/ipfs URI.
+    pub uri: String,
+}
+
+impl MintArenaItemArgs {
+    pub const MAX_NAME_LEN: usize = 32;
+    pub const MAX_SYMBOL_LEN: usize = 10;
+    pub const MAX_URI_LEN: usize = 200;
 }
 
 #[account]
@@ -245,7 +258,13 @@ pub struct ArenaItem {
     pub rarity: ArenaRarity,
     pub affixes: Vec<ArenaAffix>,
     pub skin_ref: ItemSkin,
+    /// Original creator of the item. NOT the owner — ownership is the current
+    /// holder of the `mint` NFT token (spec §11.2). Gameplay reads must resolve
+    /// the owner from the token holder, never from `minter`.
     pub minter: Pubkey,
+    /// The SPL mint of the tradeable NFT this item is bound to (1:1). The PDA is
+    /// seeded by this mint (spec §11.2).
+    pub mint: Pubkey,
     pub index: u64,
     pub bump: u8,
 }
@@ -260,6 +279,7 @@ impl ArenaItem {
         + Self::AFFIXES_SPACE
         + ItemSkin::INIT_SPACE
         + 32 // minter
+        + 32 // mint
         + 8 // index
         + 1; // bump
 

@@ -1,4 +1,9 @@
 use anchor_lang::prelude::*;
+use anchor_spl::metadata::{
+    create_master_edition_v3, create_metadata_accounts_v3,
+    mpl_token_metadata::types::DataV2, CreateMasterEditionV3, CreateMetadataAccountsV3,
+};
+use anchor_spl::token::{mint_to, MintTo};
 
 use crate::{
     affix::roll_item,
@@ -288,6 +293,20 @@ fn resolve_skin(ctx: &Context<MintArenaItem>, skin: MintSkinArg) -> Result<ItemS
 }
 
 pub fn mint_arena_item(ctx: Context<MintArenaItem>, args: MintArenaItemArgs) -> Result<()> {
+    // Validate caller-supplied NFT metadata strings (spec §11.2).
+    require!(
+        !args.name.is_empty() && args.name.len() <= MintArenaItemArgs::MAX_NAME_LEN,
+        ArenaRegistryError::InvalidNftMetadata
+    );
+    require!(
+        !args.symbol.is_empty() && args.symbol.len() <= MintArenaItemArgs::MAX_SYMBOL_LEN,
+        ArenaRegistryError::InvalidNftMetadata
+    );
+    require!(
+        !args.uri.is_empty() && args.uri.len() <= MintArenaItemArgs::MAX_URI_LEN,
+        ArenaRegistryError::InvalidNftMetadata
+    );
+
     // Resolve the skin first (and validate Stellar accounts if required).
     let skin_ref = resolve_skin(&ctx, args.skin)?;
 
@@ -296,15 +315,79 @@ pub fn mint_arena_item(ctx: Context<MintArenaItem>, args: MintArenaItemArgs) -> 
     let minter = ctx.accounts.payer.key();
     let minter_first8 = u64::from_le_bytes(minter.to_bytes()[0..8].try_into().unwrap());
 
-    let registry = &mut ctx.accounts.registry;
-    registry.bump = ctx.bumps.registry;
-    let index = registry.next_index;
-
+    let index = ctx.accounts.registry.next_index;
     let seed = crate::affix::splitmix64_mix(slothash_u64 ^ minter_first8 ^ index);
 
-    // Roll the item (spec §5).
+    // Roll the item (spec §5/§10).
     let rolled = roll_item(seed, args.base_type.to_roll());
 
+    // --- Mint the real NFT (spec §11.2): supply 1, decimals 0, Master Edition. ---
+    // 1. Mint the single token to the minter's ATA.
+    mint_to(
+        CpiContext::new(
+            ctx.accounts.token_program.to_account_info(),
+            MintTo {
+                mint: ctx.accounts.mint.to_account_info(),
+                to: ctx.accounts.minter_token_account.to_account_info(),
+                authority: ctx.accounts.payer.to_account_info(),
+            },
+        ),
+        1,
+    )?;
+
+    // 2. Create the Metaplex Metadata account (immutable: is_mutable = false).
+    let data = DataV2 {
+        name: args.name,
+        symbol: args.symbol,
+        uri: args.uri,
+        seller_fee_basis_points: 0,
+        creators: None,
+        collection: None,
+        uses: None,
+    };
+    create_metadata_accounts_v3(
+        CpiContext::new(
+            ctx.accounts.token_metadata_program.to_account_info(),
+            CreateMetadataAccountsV3 {
+                metadata: ctx.accounts.metadata_account.to_account_info(),
+                mint: ctx.accounts.mint.to_account_info(),
+                mint_authority: ctx.accounts.payer.to_account_info(),
+                payer: ctx.accounts.payer.to_account_info(),
+                update_authority: ctx.accounts.payer.to_account_info(),
+                system_program: ctx.accounts.system_program.to_account_info(),
+                rent: ctx.accounts.rent.to_account_info(),
+            },
+        ),
+        data,
+        false, // is_mutable
+        true,  // update_authority_is_signer
+        None,  // collection_details
+    )?;
+
+    // 3. Create the Master Edition (max_supply = 0 => true 1-of-1 non-fungible).
+    create_master_edition_v3(
+        CpiContext::new(
+            ctx.accounts.token_metadata_program.to_account_info(),
+            CreateMasterEditionV3 {
+                edition: ctx.accounts.master_edition.to_account_info(),
+                mint: ctx.accounts.mint.to_account_info(),
+                update_authority: ctx.accounts.payer.to_account_info(),
+                mint_authority: ctx.accounts.payer.to_account_info(),
+                payer: ctx.accounts.payer.to_account_info(),
+                metadata: ctx.accounts.metadata_account.to_account_info(),
+                token_program: ctx.accounts.token_program.to_account_info(),
+                system_program: ctx.accounts.system_program.to_account_info(),
+                rent: ctx.accounts.rent.to_account_info(),
+            },
+        ),
+        Some(0),
+    )?;
+
+    // --- Persist game stats (the source of truth), bound 1:1 to the mint. ---
+    let mint_key = ctx.accounts.mint.key();
+
+    let registry = &mut ctx.accounts.registry;
+    registry.bump = ctx.bumps.registry;
     registry.next_index = registry
         .next_index
         .checked_add(1)
@@ -326,16 +409,35 @@ pub fn mint_arena_item(ctx: Context<MintArenaItem>, args: MintArenaItemArgs) -> 
         .collect();
     item.skin_ref = skin_ref;
     item.minter = minter;
+    item.mint = mint_key;
     item.index = index;
     item.bump = ctx.bumps.arena_item;
 
     Ok(())
 }
 
-/// Scrap a rolled item — the v2 economic SINK (spec §10.5). The account is
-/// closed via the `close = minter` constraint (rent returned to the owner) and
-/// ownership is enforced by `has_one = minter` in the context. The handler body
-/// is intentionally empty: all the work happens in the account constraints.
-pub fn scrap_arena_item(_ctx: Context<ScrapArenaItem>) -> Result<()> {
+/// Scrap a rolled item — the economic SINK (spec §10.5/§11.3). BURNS the NFT
+/// via Metaplex `BurnNft` (burns the token + closes the metadata and master
+/// edition accounts), then the `close = owner` constraint closes the
+/// `ArenaItem` PDA. All rent returns to the current NFT holder (the signer).
+/// Ownership is enforced by the context: only the token holder can sign here.
+pub fn scrap_arena_item(ctx: Context<ScrapArenaItem>) -> Result<()> {
+    use anchor_spl::metadata::{burn_nft, BurnNft};
+
+    burn_nft(
+        CpiContext::new(
+            ctx.accounts.token_metadata_program.to_account_info(),
+            BurnNft {
+                metadata: ctx.accounts.metadata_account.to_account_info(),
+                owner: ctx.accounts.owner.to_account_info(),
+                mint: ctx.accounts.mint.to_account_info(),
+                token: ctx.accounts.token_account.to_account_info(),
+                edition: ctx.accounts.master_edition.to_account_info(),
+                spl_token: ctx.accounts.token_program.to_account_info(),
+            },
+        ),
+        None,
+    )?;
+
     Ok(())
 }

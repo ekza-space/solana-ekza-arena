@@ -13,6 +13,12 @@ solana_stellar = "3rVXfq7LLSLqbDzvZuSrQoMytwczLj2Q8Hue62rxPZAA"
 address = "3rVXfq7LLSLqbDzvZuSrQoMytwczLj2Q8Hue62rxPZAA"
 program = "../solana-stellar/target/deploy/solana_stellar.so"
 
+# Metaplex Token Metadata — needed for the v3 NFT mint CPI (spec §11). Dumped
+# from devnet; the shared localnet clones the same program id.
+[[test.genesis]]
+address = "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s"
+program = "/Users/wotori/git/source/solana/mpl-token-metadata/programs/.bin/token_metadata.so"
+
 [registry]
 url = "https://api.apr.dev"
 

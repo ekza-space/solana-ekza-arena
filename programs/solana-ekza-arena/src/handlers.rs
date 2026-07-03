@@ -12,14 +12,16 @@ use crate::{
         RELEASE_STATUS_LINKED, REVEAL_DELAY_SLOTS,
     },
     contexts::{
-        CommitMint, ConfigureRegistry, MintArenaItem, RegisterArenaAsset,
-        RegisterArenaAssetFromStellar, RevealMint, ScrapArenaItem,
+        CommitMint, ConfigureRegistry, CreatePlayerAvatar, CustomizeAvatar, EquipItem,
+        MintArenaItem, RegisterArenaAsset, RegisterArenaAssetFromStellar, RevealMint,
+        ScrapArenaItem, UnequipItem,
     },
     error::ArenaRegistryError,
     state::{
         ArenaAffix, ArenaAssetData, ArenaCardKind, ArenaElement, ArenaRarity, ArenaStats,
-        CommitMintArgs, ConfigureRegistryArgs, ItemSkin, MintArenaItemArgs, MintSkinArg,
-        RegisterArenaAssetArgs, RegisterArenaAssetFromStellarArgs,
+        CommitMintArgs, ConfigureRegistryArgs, CreatePlayerAvatarArgs, CustomizeAvatarArgs,
+        ItemSkin, MintArenaItemArgs, MintSkinArg, PlayerAvatar, RegisterArenaAssetArgs,
+        RegisterArenaAssetFromStellarArgs,
     },
     utils::validate_stellar_release,
     utils::{
@@ -329,18 +331,7 @@ fn resolve_skin(ctx: &Context<MintArenaItem>, skin: MintSkinArg) -> Result<ItemS
 
 pub fn mint_arena_item(ctx: Context<MintArenaItem>, args: MintArenaItemArgs) -> Result<()> {
     // Validate caller-supplied NFT metadata strings (spec §11.2).
-    require!(
-        !args.name.is_empty() && args.name.len() <= MintArenaItemArgs::MAX_NAME_LEN,
-        ArenaRegistryError::InvalidNftMetadata
-    );
-    require!(
-        !args.symbol.is_empty() && args.symbol.len() <= MintArenaItemArgs::MAX_SYMBOL_LEN,
-        ArenaRegistryError::InvalidNftMetadata
-    );
-    require!(
-        !args.uri.is_empty() && args.uri.len() <= MintArenaItemArgs::MAX_URI_LEN,
-        ArenaRegistryError::InvalidNftMetadata
-    );
+    validate_nft_metadata(&args.name, &args.symbol, &args.uri)?;
 
     // Resolve the skin first (and validate Stellar accounts if required).
     let skin_ref = resolve_skin(&ctx, args.skin)?;
@@ -700,5 +691,106 @@ pub fn reveal_mint(ctx: Context<RevealMint>, _nonce: u64) -> Result<()> {
 
     // 6. `MintCommit` is closed by the `close = minter` constraint (rent →
     //    minter). Single-shot: this commit can never be revealed again.
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Player avatar: character customization + on-chain equip.
+// ---------------------------------------------------------------------------
+
+fn validate_avatar_name(name: &str) -> Result<()> {
+    require!(
+        !name.trim().is_empty() && name.len() <= PlayerAvatar::MAX_NAME_LEN,
+        ArenaRegistryError::InvalidAvatarName
+    );
+    Ok(())
+}
+
+/// Cosmetic-only skin args allowed on a `PlayerAvatar` (no Stellar accounts in
+/// the customize path — Stellar identity enters via the avatar card itself).
+fn resolve_cosmetic_skin(skin: MintSkinArg) -> Result<ItemSkin> {
+    match skin {
+        MintSkinArg::Builtin(id) => {
+            require!(id < MAX_BUILTIN_SKINS, ArenaRegistryError::InvalidSkin);
+            Ok(ItemSkin::Builtin(id))
+        }
+        MintSkinArg::Ipfs(hash) => {
+            require!(
+                !hash.is_empty() && hash.len() <= ItemSkin::MAX_IPFS_LEN,
+                ArenaRegistryError::InvalidSkin
+            );
+            Ok(ItemSkin::Ipfs(hash))
+        }
+        MintSkinArg::Stellar => Err(ArenaRegistryError::InvalidSkin.into()),
+    }
+}
+
+pub fn create_player_avatar(
+    ctx: Context<CreatePlayerAvatar>,
+    args: CreatePlayerAvatarArgs,
+) -> Result<()> {
+    validate_avatar_name(&args.name)?;
+    let card = &ctx.accounts.avatar_asset;
+    require!(
+        card.card_kind == ArenaCardKind::Avatar,
+        ArenaRegistryError::InvalidAvatarAsset
+    );
+
+    let avatar = &mut ctx.accounts.player_avatar;
+    avatar.owner = ctx.accounts.owner.key();
+    avatar.avatar_asset = card.key();
+    avatar.name = args.name;
+    avatar.skin_ref = card.skin_ref.clone();
+    avatar.slot_mask = card.slot_mask;
+    avatar.equipped = [Pubkey::default(); PlayerAvatar::SLOT_COUNT];
+    avatar.bump = ctx.bumps.player_avatar;
+    Ok(())
+}
+
+pub fn customize_avatar(ctx: Context<CustomizeAvatar>, args: CustomizeAvatarArgs) -> Result<()> {
+    // Swap the base card first: it resets skin/slots, which the explicit
+    // name/skin args below may then override in the same call.
+    if let Some(card) = &ctx.accounts.new_avatar_asset {
+        require!(
+            card.card_kind == ArenaCardKind::Avatar,
+            ArenaRegistryError::InvalidAvatarAsset
+        );
+        let avatar = &mut ctx.accounts.player_avatar;
+        avatar.avatar_asset = card.key();
+        avatar.skin_ref = card.skin_ref.clone();
+        avatar.slot_mask = card.slot_mask;
+        // The new card may support different slots — drop everything rather
+        // than leave items in slots the character no longer has.
+        avatar.equipped = [Pubkey::default(); PlayerAvatar::SLOT_COUNT];
+    }
+
+    let avatar = &mut ctx.accounts.player_avatar;
+    if let Some(name) = args.name {
+        validate_avatar_name(&name)?;
+        avatar.name = name;
+    }
+    if let Some(skin) = args.skin {
+        avatar.skin_ref = resolve_cosmetic_skin(skin)?;
+    }
+    Ok(())
+}
+
+pub fn equip_item(ctx: Context<EquipItem>) -> Result<()> {
+    let slot = ctx.accounts.arena_item.base_type.slot_index();
+    let avatar = &mut ctx.accounts.player_avatar;
+    require!(
+        avatar.slot_mask & (1u8 << slot) != 0,
+        ArenaRegistryError::InvalidEquipSlot
+    );
+    avatar.equipped[slot as usize] = ctx.accounts.mint.key();
+    Ok(())
+}
+
+pub fn unequip_item(ctx: Context<UnequipItem>, slot: u8) -> Result<()> {
+    require!(
+        (slot as usize) < PlayerAvatar::SLOT_COUNT,
+        ArenaRegistryError::InvalidEquipSlot
+    );
+    ctx.accounts.player_avatar.equipped[slot as usize] = Pubkey::default();
     Ok(())
 }

@@ -448,8 +448,17 @@ mod tests {
     use super::*;
 
     const GOLDEN_SEED: u64 = 0x1234_5678_9ABC_DEF0;
-    const GOLDEN_PATH: &str =
-        "/Users/wotori/git/notes/projects/Ekza/dev-artifacts/affix-golden-vectors.json";
+
+    /// Where the shared v4 fixture lands: `tests/fixtures/` in this repo by
+    /// default (machine-independent), overridable via `AFFIX_GOLDEN_PATH`.
+    fn golden_path() -> std::path::PathBuf {
+        std::env::var_os("AFFIX_GOLDEN_PATH")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../tests/fixtures/affix-golden-vectors.json")
+            })
+    }
 
     /// Recompute a secondary def by kind (test helper).
     fn secondary_def(kind: u8) -> Option<&'static SecondaryDef> {
@@ -656,8 +665,12 @@ mod tests {
         let json = item_to_json(GOLDEN_SEED, &item);
 
         // Write the shared v4 fixture the frontend track asserts against.
-        std::fs::write(GOLDEN_PATH, &json).expect("write golden vector fixture");
-        println!("golden vector v4 written to {GOLDEN_PATH}\n{json}");
+        let path = golden_path();
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).expect("create golden vector fixture dir");
+        }
+        std::fs::write(&path, &json).expect("write golden vector fixture");
+        println!("golden vector v4 written to {}\n{json}", path.display());
 
         // Stable invariants on the golden vector.
         assert_eq!(item.base_type, BASE_WEAPON);

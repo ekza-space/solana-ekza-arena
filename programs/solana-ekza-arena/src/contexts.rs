@@ -7,14 +7,15 @@ use anchor_spl::{
 
 use crate::{
     constants::{
-        ARENA_ASSET_SEED, ARENA_ITEM_SEED, MINT_COMMIT_SEED, REGISTRY_SEED, STELLAR_LINK_SEED,
-        STELLAR_RELEASE_LINK_SEED,
+        ARENA_ASSET_SEED, ARENA_ITEM_SEED, MINT_COMMIT_SEED, PLAYER_AVATAR_SEED, REGISTRY_SEED,
+        STELLAR_LINK_SEED, STELLAR_RELEASE_LINK_SEED,
     },
     error::ArenaRegistryError,
     state::{
         ArenaAssetData, ArenaItem, ArenaRegistry, CommitMintArgs, ConfigureRegistryArgs,
-        MintArenaItemArgs, MintCommit, RegisterArenaAssetArgs, RegisterArenaAssetFromStellarArgs,
-        StellarArenaAssetLink, StellarReleaseLink,
+        CreatePlayerAvatarArgs, CustomizeAvatarArgs, MintArenaItemArgs, MintCommit, PlayerAvatar,
+        RegisterArenaAssetArgs, RegisterArenaAssetFromStellarArgs, StellarArenaAssetLink,
+        StellarReleaseLink,
     },
 };
 
@@ -252,6 +253,100 @@ pub struct ScrapArenaItem<'info> {
 
     pub token_metadata_program: Program<'info, Metadata>,
     pub token_program: Program<'info, Token>,
+}
+
+/// Create the player's character (`PlayerAvatar`) — one per wallet. The chosen
+/// `avatar_asset` must be an Avatar card; its `skin_ref`/`slot_mask` seed the
+/// character's defaults.
+#[derive(Accounts)]
+#[instruction(args: CreatePlayerAvatarArgs)]
+pub struct CreatePlayerAvatar<'info> {
+    #[account(
+        init,
+        payer = owner,
+        space = 8 + PlayerAvatar::INIT_SPACE,
+        seeds = [PLAYER_AVATAR_SEED, owner.key().as_ref()],
+        bump
+    )]
+    pub player_avatar: Account<'info, PlayerAvatar>,
+
+    /// The Avatar card this character is based on (kind checked in the handler).
+    pub avatar_asset: Account<'info, ArenaAssetData>,
+
+    #[account(mut)]
+    pub owner: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+/// Customize the character: rename, change the cosmetic skin, and/or swap the
+/// base Avatar card (pass `new_avatar_asset`; swapping clears all equipped
+/// slots because the new card's `slot_mask` may differ).
+#[derive(Accounts)]
+#[instruction(args: CustomizeAvatarArgs)]
+pub struct CustomizeAvatar<'info> {
+    #[account(
+        mut,
+        has_one = owner,
+        seeds = [PLAYER_AVATAR_SEED, owner.key().as_ref()],
+        bump = player_avatar.bump,
+    )]
+    pub player_avatar: Account<'info, PlayerAvatar>,
+
+    /// Optional replacement Avatar card (kind checked in the handler).
+    pub new_avatar_asset: Option<Account<'info, ArenaAssetData>>,
+
+    pub owner: Signer<'info>,
+}
+
+/// Equip an owned item NFT into the slot implied by its `base_type`. The signer
+/// must currently hold the NFT (amount == 1 in their ATA) — same holder rule as
+/// `scrap_arena_item`. Equipping over an occupied slot replaces it.
+#[derive(Accounts)]
+pub struct EquipItem<'info> {
+    #[account(
+        mut,
+        has_one = owner,
+        seeds = [PLAYER_AVATAR_SEED, owner.key().as_ref()],
+        bump = player_avatar.bump,
+    )]
+    pub player_avatar: Account<'info, PlayerAvatar>,
+
+    #[account(
+        has_one = mint,
+        seeds = [ARENA_ITEM_SEED, mint.key().as_ref()],
+        bump = arena_item.bump,
+    )]
+    pub arena_item: Account<'info, ArenaItem>,
+
+    /// The NFT mint bound to this item.
+    pub mint: Account<'info, Mint>,
+
+    /// Owner's token account — must hold exactly the 1 NFT token.
+    #[account(
+        associated_token::mint = mint,
+        associated_token::authority = owner,
+        constraint = token_account.amount == 1 @ ArenaRegistryError::NotNftHolder,
+    )]
+    pub token_account: Account<'info, TokenAccount>,
+
+    pub owner: Signer<'info>,
+}
+
+/// Clear one equip slot (by `ArenaBaseType::slot_index()`). No item accounts
+/// needed — the owner can always clear their own slot (e.g. after selling the
+/// equipped NFT).
+#[derive(Accounts)]
+pub struct UnequipItem<'info> {
+    #[account(
+        mut,
+        has_one = owner,
+        seeds = [PLAYER_AVATAR_SEED, owner.key().as_ref()],
+        bump = player_avatar.bump,
+    )]
+    pub player_avatar: Account<'info, PlayerAvatar>,
+
+    pub owner: Signer<'info>,
 }
 
 /// Configure the registry's commit-reveal economics (spec §12.1): the treasury

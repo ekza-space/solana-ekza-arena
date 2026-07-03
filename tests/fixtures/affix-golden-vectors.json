@@ -1,0 +1,12 @@
+{
+  "version": 4,
+  "seed": "0x123456789abcdef0",
+  "base_type": "Weapon",
+  "rarity": "Common",
+  "rarity_id": 0,
+  "tier": 1,
+  "element": "None",
+  "affixes": [
+    { "kind": "FlatAtk", "id": 1, "value": 8, "element": "None" }
+  ]
+}

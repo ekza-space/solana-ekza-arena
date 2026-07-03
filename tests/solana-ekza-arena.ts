@@ -354,11 +354,6 @@ describe("solana-ekza-arena", () => {
     return { mint: mint.publicKey, ata, arenaItem };
   }
 
-  it("Is initialized!", async () => {
-    const tx = await program.methods.initialize().rpc();
-    expect(tx).to.be.a("string");
-  });
-
   it("configures the registry treasury + commit fee (spec §12.1)", async () => {
     await program.methods
       .configureRegistry({
@@ -928,5 +923,295 @@ describe("solana-ekza-arena", () => {
     } catch (error) {
       expect(String(error)).to.include("Invalid Arena slot mask");
     }
+  });
+
+  // -------------------------------------------------------------------------
+  // Player avatar: character customization + on-chain equip.
+  // -------------------------------------------------------------------------
+
+  describe("player avatar", () => {
+    const playerAvatarPda = (owner: anchor.web3.PublicKey) =>
+      anchor.web3.PublicKey.findProgramAddressSync(
+        [Buffer.from("player_avatar_v1"), owner.toBuffer()],
+        program.programId
+      )[0];
+
+    // Fresh keypairs so the one-avatar-per-wallet PDA is always creatable,
+    // even on a shared/accumulated validator.
+    const avatarOwner = anchor.web3.Keypair.generate();
+    const secondOwner = anchor.web3.Keypair.generate();
+
+    // Registered in the setup test below.
+    let avatarCard: anchor.web3.PublicKey; // slotMask 3 (weapon+head)
+    let fullCard: anchor.web3.PublicKey; // slotMask 15 (all slots)
+    let modifierCard: anchor.web3.PublicKey;
+
+    const registerCard = async (args: any) => {
+      const arenaAsset = arenaAssetPda(await nextArenaAssetIndex());
+      await program.methods
+        .registerArenaAsset(args)
+        .accountsStrict({
+          registry: registryPda(),
+          arenaAsset,
+          payer: provider.wallet.publicKey,
+          systemProgram: anchor.web3.SystemProgram.programId,
+        })
+        .rpc();
+      return arenaAsset;
+    };
+
+    // Mint an item NFT with the provider wallet, then hand it to `to` (the
+    // same holder-transfer pattern the tradeability test uses).
+    const mintItemTo = async (
+      to: anchor.web3.Keypair,
+      baseType: any,
+      name: string
+    ) => {
+      const { mint, ata } = await mintArenaItemNft({
+        baseType,
+        skin: { builtin: [0] },
+        name,
+      });
+      const destAta = getAssociatedTokenAddressSync(mint, to.publicKey);
+      const tx = new anchor.web3.Transaction().add(
+        createAssociatedTokenAccountInstruction(
+          provider.wallet.publicKey,
+          destAta,
+          to.publicKey,
+          mint
+        ),
+        createTransferInstruction(ata, destAta, provider.wallet.publicKey, 1)
+      );
+      await provider.sendAndConfirm(tx);
+      return { mint, ata: destAta, arenaItem: arenaItemPda(mint) };
+    };
+
+    const equip = (owner: anchor.web3.Keypair, item: { mint: anchor.web3.PublicKey; ata: anchor.web3.PublicKey; arenaItem: anchor.web3.PublicKey }) =>
+      program.methods
+        .equipItem()
+        .accountsStrict({
+          playerAvatar: playerAvatarPda(owner.publicKey),
+          arenaItem: item.arenaItem,
+          mint: item.mint,
+          tokenAccount: item.ata,
+          owner: owner.publicKey,
+        })
+        .signers([owner])
+        .rpc();
+
+    it("setup: funds owners + registers avatar/modifier cards", async () => {
+      const fund = new anchor.web3.Transaction().add(
+        anchor.web3.SystemProgram.transfer({
+          fromPubkey: provider.wallet.publicKey,
+          toPubkey: avatarOwner.publicKey,
+          lamports: anchor.web3.LAMPORTS_PER_SOL,
+        }),
+        anchor.web3.SystemProgram.transfer({
+          fromPubkey: provider.wallet.publicKey,
+          toPubkey: secondOwner.publicKey,
+          lamports: anchor.web3.LAMPORTS_PER_SOL,
+        })
+      );
+      await provider.sendAndConfirm(fund);
+
+      avatarCard = await registerCard({
+        ...baseArgs(),
+        archetypeId: "sprout_ipfs",
+      }); // slotMask 3
+      fullCard = await registerCard({
+        ...baseArgs(),
+        archetypeId: "toka_tempest",
+        slotMask: 15,
+      });
+      modifierCard = await registerCard({
+        ...baseArgs(),
+        cardKind: { modifier: {} },
+        archetypeId: "burning_hat",
+      });
+    });
+
+    it("creates the player avatar from an Avatar card (defaults copied)", async () => {
+      const pda = playerAvatarPda(avatarOwner.publicKey);
+      await program.methods
+        .createPlayerAvatar({ name: "Wotori the Brave" })
+        .accountsStrict({
+          playerAvatar: pda,
+          avatarAsset: avatarCard,
+          owner: avatarOwner.publicKey,
+          systemProgram: anchor.web3.SystemProgram.programId,
+        })
+        .signers([avatarOwner])
+        .rpc();
+
+      const avatar = await program.account.playerAvatar.fetch(pda);
+      expect(avatar.owner.equals(avatarOwner.publicKey)).to.equal(true);
+      expect(avatar.avatarAsset.equals(avatarCard)).to.equal(true);
+      expect(avatar.name).to.equal("Wotori the Brave");
+      expect(avatar.slotMask).to.equal(3);
+      expect(avatar.skinRef).to.deep.equal({ builtin: { "0": 0 } });
+      for (const slot of avatar.equipped) {
+        expect(slot.equals(anchor.web3.PublicKey.default)).to.equal(true);
+      }
+      console.log("E2E_PROOF player_avatar=" + pda.toBase58());
+    });
+
+    it("rejects creating an avatar from a Modifier card", async () => {
+      try {
+        await program.methods
+          .createPlayerAvatar({ name: "Not An Avatar" })
+          .accountsStrict({
+            playerAvatar: playerAvatarPda(secondOwner.publicKey),
+            avatarAsset: modifierCard,
+            owner: secondOwner.publicKey,
+            systemProgram: anchor.web3.SystemProgram.programId,
+          })
+          .signers([secondOwner])
+          .rpc();
+        expect.fail("createPlayerAvatar should reject a Modifier card");
+      } catch (error) {
+        expect(String(error)).to.include("not an Avatar card");
+      }
+    });
+
+    it("equips an owned item NFT into its base-type slot", async () => {
+      const weapon = await mintItemTo(avatarOwner, { weapon: {} }, "Equip Sword");
+      await equip(avatarOwner, weapon);
+
+      const avatar = await program.account.playerAvatar.fetch(
+        playerAvatarPda(avatarOwner.publicKey)
+      );
+      expect(avatar.equipped[0].equals(weapon.mint)).to.equal(true);
+      console.log("E2E_PROOF equipped_weapon=" + weapon.mint.toBase58());
+    });
+
+    it("rejects equipping into a slot the avatar card does not support", async () => {
+      // avatarCard slotMask = 3 (weapon+head): Armor (slot 2) must be rejected.
+      const armor = await mintItemTo(avatarOwner, { armor: {} }, "Illegal Plate");
+      try {
+        await equip(avatarOwner, armor);
+        expect.fail("equipItem should reject an unsupported slot");
+      } catch (error) {
+        expect(String(error)).to.include("does not support this equip slot");
+      }
+    });
+
+    it("rejects equip after the NFT was traded away (holder rule)", async () => {
+      const head = await mintItemTo(avatarOwner, { head: {} }, "Traded Cap");
+      // avatarOwner ships the NFT to secondOwner…
+      const destAta = getAssociatedTokenAddressSync(
+        head.mint,
+        secondOwner.publicKey
+      );
+      const tx = new anchor.web3.Transaction().add(
+        createAssociatedTokenAccountInstruction(
+          avatarOwner.publicKey,
+          destAta,
+          secondOwner.publicKey,
+          head.mint
+        ),
+        createTransferInstruction(
+          head.ata,
+          destAta,
+          avatarOwner.publicKey,
+          1
+        )
+      );
+      await provider.sendAndConfirm(tx, [avatarOwner]);
+
+      // …and can no longer equip it (amount == 0 in their ATA).
+      try {
+        await equip(avatarOwner, head);
+        expect.fail("equipItem should reject a non-holder");
+      } catch (error) {
+        expect(String(error)).to.include("not the current holder");
+      }
+    });
+
+    it("unequips a slot and rejects an out-of-range slot index", async () => {
+      await program.methods
+        .unequipItem(0)
+        .accountsStrict({
+          playerAvatar: playerAvatarPda(avatarOwner.publicKey),
+          owner: avatarOwner.publicKey,
+        })
+        .signers([avatarOwner])
+        .rpc();
+      const avatar = await program.account.playerAvatar.fetch(
+        playerAvatarPda(avatarOwner.publicKey)
+      );
+      expect(avatar.equipped[0].equals(anchor.web3.PublicKey.default)).to.equal(
+        true
+      );
+
+      try {
+        await program.methods
+          .unequipItem(9)
+          .accountsStrict({
+            playerAvatar: playerAvatarPda(avatarOwner.publicKey),
+            owner: avatarOwner.publicKey,
+          })
+          .signers([avatarOwner])
+          .rpc();
+        expect.fail("unequipItem should reject slot 9");
+      } catch (error) {
+        expect(String(error)).to.include("does not support this equip slot");
+      }
+    });
+
+    it("customizes name + cosmetic skin (Stellar skin arg rejected)", async () => {
+      const pda = playerAvatarPda(avatarOwner.publicKey);
+      await program.methods
+        .customizeAvatar({ name: "Wotori Reborn", skin: { builtin: [2] } })
+        .accountsStrict({
+          playerAvatar: pda,
+          newAvatarAsset: null,
+          owner: avatarOwner.publicKey,
+        })
+        .signers([avatarOwner])
+        .rpc();
+      const avatar = await program.account.playerAvatar.fetch(pda);
+      expect(avatar.name).to.equal("Wotori Reborn");
+      expect(avatar.skinRef).to.deep.equal({ builtin: { "0": 2 } });
+
+      try {
+        await program.methods
+          .customizeAvatar({ name: null, skin: { stellar: {} } })
+          .accountsStrict({
+            playerAvatar: pda,
+            newAvatarAsset: null,
+            owner: avatarOwner.publicKey,
+          })
+          .signers([avatarOwner])
+          .rpc();
+        expect.fail("customizeAvatar should reject a Stellar skin arg");
+      } catch (error) {
+        expect(String(error)).to.include("Invalid item skin");
+      }
+    });
+
+    it("swaps the base Avatar card: slot mask updates, equips clear", async () => {
+      const pda = playerAvatarPda(avatarOwner.publicKey);
+      // Re-equip something first so the clear is observable.
+      const weapon = await mintItemTo(avatarOwner, { weapon: {} }, "Swap Sword");
+      await equip(avatarOwner, weapon);
+
+      await program.methods
+        .customizeAvatar({ name: null, skin: null })
+        .accountsStrict({
+          playerAvatar: pda,
+          newAvatarAsset: fullCard,
+          owner: avatarOwner.publicKey,
+        })
+        .signers([avatarOwner])
+        .rpc();
+
+      const avatar = await program.account.playerAvatar.fetch(pda);
+      expect(avatar.avatarAsset.equals(fullCard)).to.equal(true);
+      expect(avatar.slotMask).to.equal(15);
+      for (const slot of avatar.equipped) {
+        expect(slot.equals(anchor.web3.PublicKey.default)).to.equal(true);
+      }
+      console.log("E2E_PROOF avatar_swap_cleared_equips=true");
+    });
   });
 });

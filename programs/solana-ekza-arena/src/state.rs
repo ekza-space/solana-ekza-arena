@@ -58,6 +58,17 @@ impl ArenaBaseType {
             ArenaBaseType::Charm => crate::affix::BASE_CHARM,
         }
     }
+
+    /// Equip-slot index into `PlayerAvatar::equipped` (and bit position in the
+    /// avatar card `slot_mask`).
+    pub fn slot_index(self) -> u8 {
+        match self {
+            ArenaBaseType::Weapon => 0,
+            ArenaBaseType::Head => 1,
+            ArenaBaseType::Armor => 2,
+            ArenaBaseType::Charm => 3,
+        }
+    }
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -359,6 +370,68 @@ impl ArenaItem {
             _ => ArenaElement::None,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Player avatar (character customization + on-chain equip).
+// ---------------------------------------------------------------------------
+
+/// A player's character: one per wallet (`[PLAYER_AVATAR_SEED, owner]`).
+///
+/// Holds the chosen Avatar card, a display name, a cosmetic skin, and the
+/// equipped item NFTs — one slot per `ArenaBaseType` (Weapon/Head/Armor/Charm).
+/// A slot stores the item's **NFT mint** (`Pubkey::default()` = empty).
+///
+/// IMPORTANT for gameplay reads: equipping does NOT lock the NFT — the owner can
+/// still trade it. Clients must treat a slot as valid only while the avatar
+/// owner still holds the mint's single token (same holder-resolution rule as
+/// `ArenaItem.minter` vs owner).
+/// Equip slots on a `PlayerAvatar` — one per `ArenaBaseType`.
+pub const EQUIP_SLOT_COUNT: usize = 4;
+
+#[account]
+pub struct PlayerAvatar {
+    pub owner: Pubkey,
+    /// The `ArenaAssetData` Avatar card this character is based on.
+    pub avatar_asset: Pubkey,
+    /// Player-chosen display name (cosmetic only).
+    pub name: String,
+    /// Cosmetic skin override; defaults to the avatar card's `skin_ref`.
+    pub skin_ref: ItemSkin,
+    /// Copy of the avatar card's `slot_mask` at create/swap time — which equip
+    /// slots this character supports (bit N = `ArenaBaseType::slot_index()` N).
+    pub slot_mask: u8,
+    /// Equipped item NFT mints, indexed by `ArenaBaseType::slot_index()`.
+    pub equipped: [Pubkey; EQUIP_SLOT_COUNT],
+    pub bump: u8,
+}
+
+impl PlayerAvatar {
+    pub const SLOT_COUNT: usize = EQUIP_SLOT_COUNT;
+    pub const MAX_NAME_LEN: usize = 32;
+    pub const INIT_SPACE: usize = 32 // owner
+        + 32 // avatar_asset
+        + 4 + Self::MAX_NAME_LEN
+        + ItemSkin::INIT_SPACE
+        + 1 // slot_mask
+        + 32 * Self::SLOT_COUNT
+        + 1; // bump
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug, PartialEq, Eq)]
+pub struct CreatePlayerAvatarArgs {
+    pub name: String,
+}
+
+/// Args for `customize_avatar`. All fields optional — only supplied parts
+/// change. Passing a new `avatar_asset` account (see context) swaps the base
+/// character and clears all equipped slots.
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug, PartialEq, Eq)]
+pub struct CustomizeAvatarArgs {
+    pub name: Option<String>,
+    /// Cosmetic skin override. Only `Builtin`/`Ipfs` are accepted here (Stellar
+    /// skins enter via the avatar card's own `skin_ref`).
+    pub skin: Option<MintSkinArg>,
 }
 
 // ---------------------------------------------------------------------------

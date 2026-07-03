@@ -15,6 +15,9 @@ pub const REGISTRY_SEED: &[u8] = b"arena_registry";
 #[constant]
 pub const MINT_COMMIT_SEED: &[u8] = b"mint_commit";
 
+#[constant]
+pub const PLAYER_AVATAR_SEED: &[u8] = b"player_avatar_v1";
+
 /// Slots to wait between `commit_mint` and `reveal_mint` (spec §12.1/§12.5).
 /// The target slot's hash is unknown at commit time, killing revert-grinding.
 ///

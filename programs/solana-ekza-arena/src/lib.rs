@@ -19,10 +19,6 @@ declare_id!("D3a99Wj3eLLn4jbXU5rLDbaFT6giQiUbmcPkiyQSM8iZ");
 pub mod solana_ekza_arena {
     use super::*;
 
-    pub fn initialize(_ctx: Context<Initialize>) -> Result<()> {
-        Ok(())
-    }
-
     pub fn register_arena_asset(
         ctx: Context<RegisterArenaAsset>,
         args: RegisterArenaAssetArgs,
@@ -66,7 +62,30 @@ pub mod solana_ekza_arena {
     pub fn reveal_mint(ctx: Context<RevealMint>, nonce: u64) -> Result<()> {
         handlers::reveal_mint(ctx, nonce)
     }
-}
 
-#[derive(Accounts)]
-pub struct Initialize {}
+    /// Create the player's character (one `PlayerAvatar` per wallet).
+    pub fn create_player_avatar(
+        ctx: Context<CreatePlayerAvatar>,
+        args: CreatePlayerAvatarArgs,
+    ) -> Result<()> {
+        handlers::create_player_avatar(ctx, args)
+    }
+
+    /// Rename / reskin the character, or swap its base Avatar card.
+    pub fn customize_avatar(
+        ctx: Context<CustomizeAvatar>,
+        args: CustomizeAvatarArgs,
+    ) -> Result<()> {
+        handlers::customize_avatar(ctx, args)
+    }
+
+    /// Equip an owned item NFT into the slot implied by its base type.
+    pub fn equip_item(ctx: Context<EquipItem>) -> Result<()> {
+        handlers::equip_item(ctx)
+    }
+
+    /// Clear one equip slot (`slot` = ArenaBaseType slot index 0..3).
+    pub fn unequip_item(ctx: Context<UnequipItem>, slot: u8) -> Result<()> {
+        handlers::unequip_item(ctx, slot)
+    }
+}

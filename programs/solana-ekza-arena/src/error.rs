@@ -42,4 +42,10 @@ pub enum ArenaRegistryError {
     RegistryNotConfigured,
     #[msg("The supplied treasury account does not match the configured treasury.")]
     InvalidTreasury,
+    #[msg("The referenced arena asset is not an Avatar card.")]
+    InvalidAvatarAsset,
+    #[msg("Invalid avatar name (empty or too long).")]
+    InvalidAvatarName,
+    #[msg("The avatar does not support this equip slot.")]
+    InvalidEquipSlot,
 }

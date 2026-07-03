@@ -1642,6 +1642,7 @@ dependencies = [
  "anchor-lang",
  "anchor-spl",
  "mpl-token-metadata",
+ "solana-stellar",
 ]
 
 [[package]]
@@ -2276,6 +2277,13 @@ dependencies = [
  "solana-pubkey",
  "solana-system-interface",
  "solana-sysvar-id",
+]
+
+[[package]]
+name = "solana-stellar"
+version = "0.1.0"
+dependencies = [
+ "anchor-lang",
 ]
 
 [[package]]

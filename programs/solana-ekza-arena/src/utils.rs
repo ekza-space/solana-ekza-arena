@@ -1,38 +1,31 @@
-use anchor_lang::{
-    prelude::*,
-    solana_program::{
-        instruction::{AccountMeta, Instruction},
-        program::invoke,
-    },
-};
+//! The Stellar gate — Arena side.
+//!
+//! Everything here goes through the `solana-stellar` crate (typed `state::*`
+//! accounts + generated `cpi::*` clients), never hand-rolled offsets or
+//! discriminators: if the upstream `Release`/`Universe` layout or instruction
+//! signatures change, this file fails to COMPILE instead of silently reading
+//! garbage. This is the reference consumer implementation of the gate contract
+//! (see solana-stellar/docs/INTEGRATION.md).
 
-use crate::{
-    constants::{
-        LINK_AVATAR_DATA_DISCRIMINATOR, RECORD_RELEASE_DEPLOYMENT_DISCRIMINATOR,
-        RELEASE_ACCOUNT_DISCRIMINATOR, RELEASE_ASSET_OFFSET, RELEASE_STATUS_FINALIZED,
-        RELEASE_STATUS_LINKED, RELEASE_STATUS_OFFSET, RELEASE_UNIVERSE_OFFSET,
-        RELEASE_VAULT_OFFSET, SOLANA_STELLAR_PROGRAM_ID, UNIVERSE_ACCOUNT_DISCRIMINATOR,
-        UNIVERSE_OWNER_OFFSET,
-    },
-    error::ArenaRegistryError,
-};
+use anchor_lang::prelude::*;
+use solana_stellar::state::{Release, ReleaseStatus, Universe};
 
+use crate::error::ArenaRegistryError;
+
+/// Identity of a validated Stellar release, as read from the typed account.
 pub struct StellarReleaseOrigin {
     pub universe: Pubkey,
     pub asset: Pubkey,
     pub vault: Pubkey,
-    pub status: u8,
+    pub status: ReleaseStatus,
 }
 
-fn read_pubkey(data: &[u8], offset: usize, error: ArenaRegistryError) -> Result<Pubkey> {
-    if data.len() < offset + 32 {
-        return Err(error.into());
-    }
-    let mut bytes = [0_u8; 32];
-    bytes.copy_from_slice(&data[offset..offset + 32]);
-    Ok(Pubkey::new_from_array(bytes))
-}
-
+/// Validate a solana-stellar `Release` account and return its identity.
+///
+/// Checks: the supplied program IS solana-stellar and executable, the release
+/// is owned by it, deserializes as a `Release` (discriminator enforced by
+/// `try_deserialize`), the stored vault matches, and the status is
+/// `Finalized` or `Linked` (the only publishable states).
 pub fn validate_stellar_release<'info>(
     stellar_program: &AccountInfo<'info>,
     release: &AccountInfo<'info>,
@@ -40,7 +33,7 @@ pub fn validate_stellar_release<'info>(
 ) -> Result<StellarReleaseOrigin> {
     require_keys_eq!(
         *stellar_program.key,
-        SOLANA_STELLAR_PROGRAM_ID,
+        solana_stellar::ID,
         ArenaRegistryError::InvalidStellarProgram
     );
     require!(
@@ -49,55 +42,37 @@ pub fn validate_stellar_release<'info>(
     );
     require_keys_eq!(
         *release.owner,
-        *stellar_program.key,
+        solana_stellar::ID,
         ArenaRegistryError::InvalidStellarRelease
     );
 
     let release_data = release.try_borrow_data()?;
-    require!(
-        release_data.len() > RELEASE_STATUS_OFFSET,
-        ArenaRegistryError::InvalidStellarRelease
-    );
-    require!(
-        release_data.get(..8) == Some(RELEASE_ACCOUNT_DISCRIMINATOR.as_ref()),
-        ArenaRegistryError::InvalidStellarRelease
-    );
+    let release_account = Release::try_deserialize(&mut release_data.as_ref())
+        .map_err(|_| ArenaRegistryError::InvalidStellarRelease)?;
 
-    let stored_universe = read_pubkey(
-        &release_data,
-        RELEASE_UNIVERSE_OFFSET,
-        ArenaRegistryError::InvalidStellarRelease,
-    )?;
-    let stored_asset = read_pubkey(
-        &release_data,
-        RELEASE_ASSET_OFFSET,
-        ArenaRegistryError::InvalidStellarRelease,
-    )?;
-    let stored_vault = read_pubkey(
-        &release_data,
-        RELEASE_VAULT_OFFSET,
-        ArenaRegistryError::InvalidStellarRelease,
-    )?;
     require_keys_eq!(
-        stored_vault,
+        release_account.vault,
         *vault.key,
         ArenaRegistryError::InvalidStellarVault
     );
-
-    let status = release_data[RELEASE_STATUS_OFFSET];
     require!(
-        status == RELEASE_STATUS_FINALIZED || status == RELEASE_STATUS_LINKED,
+        matches!(
+            release_account.status,
+            ReleaseStatus::Finalized | ReleaseStatus::Linked
+        ),
         ArenaRegistryError::InvalidStellarRelease
     );
 
     Ok(StellarReleaseOrigin {
-        universe: stored_universe,
-        asset: stored_asset,
-        vault: stored_vault,
-        status,
+        universe: release_account.universe,
+        asset: release_account.asset,
+        vault: release_account.vault,
+        status: release_account.status,
     })
 }
 
+/// Validate that `universe` is the release's universe, is a real solana-stellar
+/// `Universe` account, and is owned by `expected_owner` (the publisher).
 pub fn validate_stellar_universe_owner<'info>(
     stellar_program: &AccountInfo<'info>,
     universe: &AccountInfo<'info>,
@@ -116,17 +91,10 @@ pub fn validate_stellar_universe_owner<'info>(
     );
 
     let universe_data = universe.try_borrow_data()?;
-    require!(
-        universe_data.get(..8) == Some(UNIVERSE_ACCOUNT_DISCRIMINATOR.as_ref()),
-        ArenaRegistryError::InvalidStellarUniverse
-    );
-    let stored_owner = read_pubkey(
-        &universe_data,
-        UNIVERSE_OWNER_OFFSET,
-        ArenaRegistryError::InvalidStellarUniverse,
-    )?;
+    let universe_account = Universe::try_deserialize(&mut universe_data.as_ref())
+        .map_err(|_| ArenaRegistryError::InvalidStellarUniverse)?;
     require_keys_eq!(
-        stored_owner,
+        universe_account.owner,
         expected_owner,
         ArenaRegistryError::Unauthorized
     );
@@ -134,6 +102,8 @@ pub fn validate_stellar_universe_owner<'info>(
     Ok(())
 }
 
+/// CPI `link_avatar_data`: bind the Arena card back into the Stellar release
+/// (Finalized → Linked). Signer must be the universe owner.
 pub fn link_arena_asset_to_stellar<'info>(
     arena_asset: Pubkey,
     owner: &AccountInfo<'info>,
@@ -141,33 +111,22 @@ pub fn link_arena_asset_to_stellar<'info>(
     universe: &AccountInfo<'info>,
     release: &AccountInfo<'info>,
 ) -> Result<()> {
-    let mut data = Vec::with_capacity(40);
-    data.extend_from_slice(&LINK_AVATAR_DATA_DISCRIMINATOR);
-    data.extend_from_slice(arena_asset.as_ref());
-
-    let ix = Instruction {
-        program_id: *stellar_program.key,
-        accounts: vec![
-            AccountMeta::new_readonly(*universe.key, false),
-            AccountMeta::new(*release.key, false),
-            AccountMeta::new_readonly(*owner.key, true),
-        ],
-        data,
-    };
-
-    invoke(
-        &ix,
-        &[
-            universe.clone(),
-            release.clone(),
-            owner.clone(),
+    solana_stellar::cpi::link_avatar_data(
+        CpiContext::new(
             stellar_program.clone(),
-        ],
-    )?;
-
-    Ok(())
+            solana_stellar::cpi::accounts::LinkAvatarData {
+                universe: universe.clone(),
+                release: release.clone(),
+                owner: owner.clone(),
+            },
+        ),
+        arena_asset,
+    )
 }
 
+/// CPI `record_release_deployment`: write the per-project bridge record on the
+/// Stellar side (seeds `[b"release_deployment", release, project_slug]`).
+/// Signer must be the release authority.
 pub fn record_release_deployment_to_stellar<'info>(
     project_slug: &str,
     registry_program: Pubkey,
@@ -178,35 +137,18 @@ pub fn record_release_deployment_to_stellar<'info>(
     deployment: &AccountInfo<'info>,
     system_program: &AccountInfo<'info>,
 ) -> Result<()> {
-    let slug_bytes = project_slug.as_bytes();
-    let mut data = Vec::with_capacity(8 + 4 + slug_bytes.len() + 32 + 32);
-    data.extend_from_slice(&RECORD_RELEASE_DEPLOYMENT_DISCRIMINATOR);
-    data.extend_from_slice(&(slug_bytes.len() as u32).to_le_bytes());
-    data.extend_from_slice(slug_bytes);
-    data.extend_from_slice(registry_program.as_ref());
-    data.extend_from_slice(registry_record.as_ref());
-
-    let ix = Instruction {
-        program_id: *stellar_program.key,
-        accounts: vec![
-            AccountMeta::new_readonly(*release.key, false),
-            AccountMeta::new(*deployment.key, false),
-            AccountMeta::new(*owner.key, true),
-            AccountMeta::new_readonly(*system_program.key, false),
-        ],
-        data,
-    };
-
-    invoke(
-        &ix,
-        &[
-            release.clone(),
-            deployment.clone(),
-            owner.clone(),
-            system_program.clone(),
+    solana_stellar::cpi::record_release_deployment(
+        CpiContext::new(
             stellar_program.clone(),
-        ],
-    )?;
-
-    Ok(())
+            solana_stellar::cpi::accounts::RecordReleaseDeployment {
+                release: release.clone(),
+                deployment: deployment.clone(),
+                authority: owner.clone(),
+                system_program: system_program.clone(),
+            },
+        ),
+        project_slug.to_string(),
+        registry_program,
+        registry_record,
+    )
 }

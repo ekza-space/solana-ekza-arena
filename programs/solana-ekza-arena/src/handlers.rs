@@ -5,12 +5,11 @@ use anchor_spl::metadata::{
 };
 use anchor_spl::token::{mint_to, MintTo};
 
+use solana_stellar::state::ReleaseStatus;
+
 use crate::{
     affix::{roll_item, roll_item_capped, RARITY_LEGENDARY},
-    constants::{
-        MAX_BUILTIN_SKINS, RELEASE_DEPLOYMENT_PROJECT_ARENA, RELEASE_STATUS_FINALIZED,
-        RELEASE_STATUS_LINKED, REVEAL_DELAY_SLOTS,
-    },
+    constants::{MAX_BUILTIN_SKINS, RELEASE_DEPLOYMENT_PROJECT_ARENA, REVEAL_DELAY_SLOTS},
     contexts::{
         CommitMint, ConfigureRegistry, CreatePlayerAvatar, CustomizeAvatar, EquipItem,
         MintArenaItem, RegisterArenaAsset, RegisterArenaAssetFromStellar, RevealMint,
@@ -162,7 +161,10 @@ pub fn register_arena_asset_from_stellar(
         ctx.accounts.payer.key(),
     )?;
     require!(
-        origin.status == RELEASE_STATUS_FINALIZED || origin.status == RELEASE_STATUS_LINKED,
+        matches!(
+            origin.status,
+            ReleaseStatus::Finalized | ReleaseStatus::Linked
+        ),
         ArenaRegistryError::InvalidStellarRelease
     );
 
@@ -212,7 +214,7 @@ pub fn register_arena_asset_from_stellar(
     stellar_release_link.arena_asset = ctx.accounts.arena_asset.key();
     stellar_release_link.bump = ctx.bumps.stellar_release_link;
 
-    if origin.status == RELEASE_STATUS_FINALIZED {
+    if origin.status == ReleaseStatus::Finalized {
         link_arena_asset_to_stellar(
             ctx.accounts.arena_asset.key(),
             &ctx.accounts.payer.to_account_info(),
@@ -311,8 +313,10 @@ fn resolve_skin_accounts<'info>(
             let origin =
                 validate_stellar_release(stellar_program, stellar_release, stellar_vault)?;
             require!(
-                origin.status == RELEASE_STATUS_FINALIZED
-                    || origin.status == RELEASE_STATUS_LINKED,
+                matches!(
+                    origin.status,
+                    ReleaseStatus::Finalized | ReleaseStatus::Linked
+                ),
                 ArenaRegistryError::InvalidStellarRelease
             );
             Ok(ItemSkin::StellarAsset(origin.asset))

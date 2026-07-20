@@ -88,4 +88,16 @@ pub mod solana_ekza_arena {
     pub fn unequip_item(ctx: Context<UnequipItem>, slot: u8) -> Result<()> {
         handlers::unequip_item(ctx, slot)
     }
+
+    /// v2 equip ("Lineage tribute"): place an owned item NFT into an explicit
+    /// slot (0=Weapon 1=Head 2=Body 3=Gloves 4=Boots 5=Amulet 6=Ring) of the
+    /// avatar's `EquipmentRecord` (`["equipment", avatar]`).
+    pub fn equip_item_v2(ctx: Context<EquipItemV2>, slot: u8) -> Result<()> {
+        handlers::equip_item_v2(ctx, slot)
+    }
+
+    /// v2 unequip: clear one `EquipmentRecord` slot (0..6).
+    pub fn unequip_item_v2(ctx: Context<UnequipItemV2>, slot: u8) -> Result<()> {
+        handlers::unequip_item_v2(ctx, slot)
+    }
 }

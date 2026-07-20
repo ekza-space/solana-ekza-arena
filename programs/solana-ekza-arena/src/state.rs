@@ -69,6 +69,90 @@ impl ArenaBaseType {
             ArenaBaseType::Charm => 3,
         }
     }
+
+    /// v2 slot-compatibility rule ("Lineage tribute" equip protocol).
+    ///
+    /// The 7 web equip slots map onto the 4 on-chain item classes:
+    ///   Weapon → Weapon; Head → Head;
+    ///   Armor  → Body | Gloves | Boots (any Armor-class piece);
+    ///   Charm  → Amulet | Ring        (any Charm-class trinket).
+    /// Reserved slots (7..15) accept nothing until a future version names them.
+    pub fn allowed_in_equip_slot(self, slot: u8) -> bool {
+        match slot {
+            EQUIP_SLOT_WEAPON => self == ArenaBaseType::Weapon,
+            EQUIP_SLOT_HEAD => self == ArenaBaseType::Head,
+            EQUIP_SLOT_BODY | EQUIP_SLOT_GLOVES | EQUIP_SLOT_BOOTS => {
+                self == ArenaBaseType::Armor
+            }
+            EQUIP_SLOT_AMULET | EQUIP_SLOT_RING => self == ArenaBaseType::Charm,
+            _ => false,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// v2 equip slots ("Lineage tribute"): the equipped set IS the core protocol.
+// Order mirrors the web client's `EQUIPMENT_SLOTS` exactly.
+// ---------------------------------------------------------------------------
+
+pub const EQUIP_SLOT_WEAPON: u8 = 0;
+pub const EQUIP_SLOT_HEAD: u8 = 1;
+pub const EQUIP_SLOT_BODY: u8 = 2;
+pub const EQUIP_SLOT_GLOVES: u8 = 3;
+pub const EQUIP_SLOT_BOOTS: u8 = 4;
+pub const EQUIP_SLOT_AMULET: u8 = 5;
+pub const EQUIP_SLOT_RING: u8 = 6;
+
+/// Slots currently addressable by `equip_item_v2` / `unequip_item_v2`.
+pub const ACTIVE_EQUIP_SLOT_COUNT: u8 = 7;
+
+/// Physical slots reserved in `EquipmentRecord` (room to grow without another
+/// layout migration).
+pub const EQUIPMENT_RECORD_SLOTS: usize = 16;
+
+/// Legacy `PlayerAvatar::equipped` index mirrored by a v2 slot, so pre-v2
+/// readers keep seeing the canonical four. Only the canonical slot of each
+/// item class mirrors: Weapon→0, Head→1, Body→2 (Armor), Amulet→3 (Charm).
+/// Gloves/Boots/Ring exist only in the `EquipmentRecord`.
+pub fn legacy_equipped_index(slot: u8) -> Option<usize> {
+    match slot {
+        EQUIP_SLOT_WEAPON => Some(0),
+        EQUIP_SLOT_HEAD => Some(1),
+        EQUIP_SLOT_BODY => Some(2),
+        EQUIP_SLOT_AMULET => Some(3),
+        _ => None,
+    }
+}
+
+/// The full equipped set of one `PlayerAvatar` — THE battle-relevant read.
+///
+/// PDA: `["equipment", player_avatar]`. Created lazily (init_if_needed) by the
+/// first `equip_item_v2`/`unequip_item_v2`; a missing record simply means
+/// "nothing equipped via v2" (readers fall back to the legacy 4-slot mirror on
+/// the avatar). Chosen over resizing `PlayerAvatar.equipped` because that is a
+/// fixed `[Pubkey; 4]` baked into every deployed avatar account — a separate
+/// PDA needs zero migration and keeps old readers working.
+///
+/// Same holder rule as the legacy slots: equipping does NOT lock the NFT.
+/// A slot is valid for a fight only while `owner` still holds the mint's
+/// single token.
+#[account]
+pub struct EquipmentRecord {
+    /// The `PlayerAvatar` this record belongs to (PDA seed).
+    pub avatar: Pubkey,
+    /// The avatar's owner wallet (denormalized for cheap holder checks).
+    pub owner: Pubkey,
+    /// Equipped item NFT mints, indexed by `EQUIP_SLOT_*`
+    /// (`Pubkey::default()` = empty). Slots 7..15 are reserved.
+    pub slots: [Pubkey; EQUIPMENT_RECORD_SLOTS],
+    pub bump: u8,
+}
+
+impl EquipmentRecord {
+    pub const INIT_SPACE: usize = 32 // avatar
+        + 32 // owner
+        + 32 * EQUIPMENT_RECORD_SLOTS
+        + 1; // bump
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, PartialEq, Eq)]

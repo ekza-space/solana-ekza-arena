@@ -1213,5 +1213,232 @@ describe("solana-ekza-arena", () => {
       }
       console.log("E2E_PROOF avatar_swap_cleared_equips=true");
     });
+
+    // -----------------------------------------------------------------------
+    // v2 equip ("Lineage tribute"): EquipmentRecord PDA, 7 explicit slots.
+    // Slot order mirrors the web EQUIPMENT_SLOTS:
+    //   0=Weapon 1=Head 2=Body 3=Gloves 4=Boots 5=Amulet 6=Ring
+    // -----------------------------------------------------------------------
+
+    describe("equipment record (v2 slots)", () => {
+      const SLOT = {
+        Weapon: 0,
+        Head: 1,
+        Body: 2,
+        Gloves: 3,
+        Boots: 4,
+        Amulet: 5,
+        Ring: 6,
+      } as const;
+
+      const equipmentPda = (owner: anchor.web3.PublicKey) =>
+        anchor.web3.PublicKey.findProgramAddressSync(
+          [Buffer.from("equipment"), playerAvatarPda(owner).toBuffer()],
+          program.programId
+        )[0];
+
+      const equipV2 = (
+        owner: anchor.web3.Keypair,
+        item: {
+          mint: anchor.web3.PublicKey;
+          ata: anchor.web3.PublicKey;
+          arenaItem: anchor.web3.PublicKey;
+        },
+        slot: number
+      ) =>
+        program.methods
+          .equipItemV2(slot)
+          .accountsStrict({
+            playerAvatar: playerAvatarPda(owner.publicKey),
+            equipmentRecord: equipmentPda(owner.publicKey),
+            arenaItem: item.arenaItem,
+            mint: item.mint,
+            tokenAccount: item.ata,
+            owner: owner.publicKey,
+            systemProgram: anchor.web3.SystemProgram.programId,
+          })
+          .signers([owner])
+          .rpc();
+
+      const unequipV2 = (owner: anchor.web3.Keypair, slot: number) =>
+        program.methods
+          .unequipItemV2(slot)
+          .accountsStrict({
+            playerAvatar: playerAvatarPda(owner.publicKey),
+            equipmentRecord: equipmentPda(owner.publicKey),
+            owner: owner.publicKey,
+            systemProgram: anchor.web3.SystemProgram.programId,
+          })
+          .signers([owner])
+          .rpc();
+
+      // avatarOwner now wears the fullCard (slotMask 15) from the swap test.
+      it("equips the full 7-slot set (Armor→Body/Gloves/Boots, Charm→Amulet/Ring)", async () => {
+        const weapon = await mintItemTo(avatarOwner, { weapon: {} }, "V2 Sword");
+        const head = await mintItemTo(avatarOwner, { head: {} }, "V2 Helm");
+        const body = await mintItemTo(avatarOwner, { armor: {} }, "V2 Plate");
+        const gloves = await mintItemTo(avatarOwner, { armor: {} }, "V2 Gloves");
+        const boots = await mintItemTo(avatarOwner, { armor: {} }, "V2 Boots");
+        const amulet = await mintItemTo(avatarOwner, { charm: {} }, "V2 Amulet");
+        const ring = await mintItemTo(avatarOwner, { charm: {} }, "V2 Ring");
+
+        await equipV2(avatarOwner, weapon, SLOT.Weapon);
+        await equipV2(avatarOwner, head, SLOT.Head);
+        await equipV2(avatarOwner, body, SLOT.Body);
+        await equipV2(avatarOwner, gloves, SLOT.Gloves);
+        await equipV2(avatarOwner, boots, SLOT.Boots);
+        await equipV2(avatarOwner, amulet, SLOT.Amulet);
+        await equipV2(avatarOwner, ring, SLOT.Ring);
+
+        // FULL-SET READ: the record is the single battle-relevant account.
+        const record = await program.account.equipmentRecord.fetch(
+          equipmentPda(avatarOwner.publicKey)
+        );
+        expect(
+          record.avatar.equals(playerAvatarPda(avatarOwner.publicKey))
+        ).to.equal(true);
+        expect(record.owner.equals(avatarOwner.publicKey)).to.equal(true);
+        expect(record.slots.length).to.equal(16); // 16 reserved slots
+        expect(record.slots[SLOT.Weapon].equals(weapon.mint)).to.equal(true);
+        expect(record.slots[SLOT.Head].equals(head.mint)).to.equal(true);
+        expect(record.slots[SLOT.Body].equals(body.mint)).to.equal(true);
+        expect(record.slots[SLOT.Gloves].equals(gloves.mint)).to.equal(true);
+        expect(record.slots[SLOT.Boots].equals(boots.mint)).to.equal(true);
+        expect(record.slots[SLOT.Amulet].equals(amulet.mint)).to.equal(true);
+        expect(record.slots[SLOT.Ring].equals(ring.mint)).to.equal(true);
+        for (let i = 7; i < 16; i++) {
+          expect(
+            record.slots[i].equals(anchor.web3.PublicKey.default)
+          ).to.equal(true);
+        }
+
+        // Legacy mirror: canonical slots reflected into PlayerAvatar.equipped.
+        const avatar = await program.account.playerAvatar.fetch(
+          playerAvatarPda(avatarOwner.publicKey)
+        );
+        expect(avatar.equipped[0].equals(weapon.mint)).to.equal(true);
+        expect(avatar.equipped[1].equals(head.mint)).to.equal(true);
+        expect(avatar.equipped[2].equals(body.mint)).to.equal(true);
+        expect(avatar.equipped[3].equals(amulet.mint)).to.equal(true);
+        console.log(
+          "E2E_PROOF equipment_record=" +
+            equipmentPda(avatarOwner.publicKey).toBase58()
+        );
+      });
+
+      it("rejects a base-type/slot mismatch (Weapon into Head, Armor into Ring)", async () => {
+        const weapon = await mintItemTo(avatarOwner, { weapon: {} }, "Bad Fit");
+        try {
+          await equipV2(avatarOwner, weapon, SLOT.Head);
+          expect.fail("equipItemV2 should reject Weapon in the Head slot");
+        } catch (error) {
+          expect(String(error)).to.include("cannot be equipped into");
+        }
+        const armor = await mintItemTo(avatarOwner, { armor: {} }, "Bad Ring");
+        try {
+          await equipV2(avatarOwner, armor, SLOT.Ring);
+          expect.fail("equipItemV2 should reject Armor in the Ring slot");
+        } catch (error) {
+          expect(String(error)).to.include("cannot be equipped into");
+        }
+      });
+
+      it("rejects reserved/out-of-range slots (7..)", async () => {
+        const weapon = await mintItemTo(avatarOwner, { weapon: {} }, "Slot Nine");
+        try {
+          await equipV2(avatarOwner, weapon, 9);
+          expect.fail("equipItemV2 should reject slot 9");
+        } catch (error) {
+          expect(String(error)).to.include("does not support this equip slot");
+        }
+      });
+
+      it("rejects equip when the avatar card lacks the item class (slot_mask)", async () => {
+        // secondOwner gets an avatar from avatarCard (slotMask 3: weapon+head
+        // only) — Armor into Body must be rejected by the mask check.
+        await program.methods
+          .createPlayerAvatar({ name: "Masked" })
+          .accountsStrict({
+            playerAvatar: playerAvatarPda(secondOwner.publicKey),
+            avatarAsset: avatarCard,
+            owner: secondOwner.publicKey,
+            systemProgram: anchor.web3.SystemProgram.programId,
+          })
+          .signers([secondOwner])
+          .rpc();
+        const armor = await mintItemTo(secondOwner, { armor: {} }, "No Mask");
+        try {
+          await equipV2(secondOwner, armor, SLOT.Body);
+          expect.fail("equipItemV2 should reject a masked-out item class");
+        } catch (error) {
+          expect(String(error)).to.include("does not support this equip slot");
+        }
+      });
+
+      it("rejects v2 equip after the NFT was traded away (holder rule)", async () => {
+        const ring = await mintItemTo(avatarOwner, { charm: {} }, "Traded Ring");
+        const destAta = getAssociatedTokenAddressSync(
+          ring.mint,
+          secondOwner.publicKey
+        );
+        const tx = new anchor.web3.Transaction().add(
+          createAssociatedTokenAccountInstruction(
+            avatarOwner.publicKey,
+            destAta,
+            secondOwner.publicKey,
+            ring.mint
+          ),
+          createTransferInstruction(
+            ring.ata,
+            destAta,
+            avatarOwner.publicKey,
+            1
+          )
+        );
+        await provider.sendAndConfirm(tx, [avatarOwner]);
+
+        try {
+          await equipV2(avatarOwner, ring, SLOT.Ring);
+          expect.fail("equipItemV2 should reject a non-holder");
+        } catch (error) {
+          expect(String(error)).to.include("not the current holder");
+        }
+      });
+
+      it("unequips a v2 slot (record + legacy mirror both clear)", async () => {
+        await unequipV2(avatarOwner, SLOT.Body);
+        await unequipV2(avatarOwner, SLOT.Gloves);
+
+        const record = await program.account.equipmentRecord.fetch(
+          equipmentPda(avatarOwner.publicKey)
+        );
+        expect(
+          record.slots[SLOT.Body].equals(anchor.web3.PublicKey.default)
+        ).to.equal(true);
+        expect(
+          record.slots[SLOT.Gloves].equals(anchor.web3.PublicKey.default)
+        ).to.equal(true);
+        // Boots untouched.
+        expect(
+          record.slots[SLOT.Boots].equals(anchor.web3.PublicKey.default)
+        ).to.equal(false);
+
+        // Legacy mirror of Body (index 2) cleared too.
+        const avatar = await program.account.playerAvatar.fetch(
+          playerAvatarPda(avatarOwner.publicKey)
+        );
+        expect(
+          avatar.equipped[2].equals(anchor.web3.PublicKey.default)
+        ).to.equal(true);
+
+        try {
+          await unequipV2(avatarOwner, 12);
+          expect.fail("unequipItemV2 should reject slot 12");
+        } catch (error) {
+          expect(String(error)).to.include("does not support this equip slot");
+        }
+        console.log("E2E_PROOF equipment_v2_unequip=true");
+      });
+    });
   });
 });

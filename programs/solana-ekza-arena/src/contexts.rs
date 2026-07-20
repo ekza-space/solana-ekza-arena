@@ -7,15 +7,15 @@ use anchor_spl::{
 
 use crate::{
     constants::{
-        ARENA_ASSET_SEED, ARENA_ITEM_SEED, MINT_COMMIT_SEED, PLAYER_AVATAR_SEED, REGISTRY_SEED,
-        STELLAR_LINK_SEED, STELLAR_RELEASE_LINK_SEED,
+        ARENA_ASSET_SEED, ARENA_ITEM_SEED, EQUIPMENT_SEED, MINT_COMMIT_SEED, PLAYER_AVATAR_SEED,
+        REGISTRY_SEED, STELLAR_LINK_SEED, STELLAR_RELEASE_LINK_SEED,
     },
     error::ArenaRegistryError,
     state::{
         ArenaAssetData, ArenaItem, ArenaRegistry, CommitMintArgs, ConfigureRegistryArgs,
-        CreatePlayerAvatarArgs, CustomizeAvatarArgs, MintArenaItemArgs, MintCommit, PlayerAvatar,
-        RegisterArenaAssetArgs, RegisterArenaAssetFromStellarArgs, StellarArenaAssetLink,
-        StellarReleaseLink,
+        CreatePlayerAvatarArgs, CustomizeAvatarArgs, EquipmentRecord, MintArenaItemArgs,
+        MintCommit, PlayerAvatar, RegisterArenaAssetArgs, RegisterArenaAssetFromStellarArgs,
+        StellarArenaAssetLink, StellarReleaseLink,
     },
 };
 
@@ -347,6 +347,84 @@ pub struct UnequipItem<'info> {
     pub player_avatar: Account<'info, PlayerAvatar>,
 
     pub owner: Signer<'info>,
+}
+
+/// v2 equip ("Lineage tribute"): place an owned item NFT into an explicit slot
+/// (0..6, web `EQUIPMENT_SLOTS` order) of the avatar's `EquipmentRecord`.
+/// Holder rule identical to `EquipItem`: the signer must hold the single NFT
+/// token. The record is created lazily on first use (rent paid by the owner).
+#[derive(Accounts)]
+#[instruction(slot: u8)]
+pub struct EquipItemV2<'info> {
+    #[account(
+        mut,
+        has_one = owner,
+        seeds = [PLAYER_AVATAR_SEED, owner.key().as_ref()],
+        bump = player_avatar.bump,
+    )]
+    pub player_avatar: Account<'info, PlayerAvatar>,
+
+    /// The avatar's full equipped set — created on first equip/unequip.
+    #[account(
+        init_if_needed,
+        payer = owner,
+        space = 8 + EquipmentRecord::INIT_SPACE,
+        seeds = [EQUIPMENT_SEED, player_avatar.key().as_ref()],
+        bump
+    )]
+    pub equipment_record: Account<'info, EquipmentRecord>,
+
+    #[account(
+        has_one = mint,
+        seeds = [ARENA_ITEM_SEED, mint.key().as_ref()],
+        bump = arena_item.bump,
+    )]
+    pub arena_item: Account<'info, ArenaItem>,
+
+    /// The NFT mint bound to this item.
+    pub mint: Account<'info, Mint>,
+
+    /// Owner's token account — must hold exactly the 1 NFT token.
+    #[account(
+        associated_token::mint = mint,
+        associated_token::authority = owner,
+        constraint = token_account.amount == 1 @ ArenaRegistryError::NotNftHolder,
+    )]
+    pub token_account: Account<'info, TokenAccount>,
+
+    #[account(mut)]
+    pub owner: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+/// v2 unequip: clear one slot (0..6) of the avatar's `EquipmentRecord` (and
+/// its legacy mirror on the avatar, if any). No item accounts needed — the
+/// owner can always clear their own slot (e.g. after selling the NFT).
+#[derive(Accounts)]
+#[instruction(slot: u8)]
+pub struct UnequipItemV2<'info> {
+    #[account(
+        mut,
+        has_one = owner,
+        seeds = [PLAYER_AVATAR_SEED, owner.key().as_ref()],
+        bump = player_avatar.bump,
+    )]
+    pub player_avatar: Account<'info, PlayerAvatar>,
+
+    #[account(
+        init_if_needed,
+        payer = owner,
+        space = 8 + EquipmentRecord::INIT_SPACE,
+        seeds = [EQUIPMENT_SEED, player_avatar.key().as_ref()],
+        bump
+    )]
+    pub equipment_record: Account<'info, EquipmentRecord>,
+
+    #[account(mut)]
+    pub owner: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
 }
 
 /// Configure the registry's commit-reveal economics (spec §12.1): the treasury

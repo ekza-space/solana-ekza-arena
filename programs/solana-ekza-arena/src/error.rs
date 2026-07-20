@@ -48,4 +48,6 @@ pub enum ArenaRegistryError {
     InvalidAvatarName,
     #[msg("The avatar does not support this equip slot.")]
     InvalidEquipSlot,
+    #[msg("The item's base type cannot be equipped into the requested slot.")]
+    ItemSlotMismatch,
 }

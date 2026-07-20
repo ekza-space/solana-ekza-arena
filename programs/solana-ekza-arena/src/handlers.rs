@@ -12,8 +12,8 @@ use crate::{
     constants::{MAX_BUILTIN_SKINS, RELEASE_DEPLOYMENT_PROJECT_ARENA, REVEAL_DELAY_SLOTS},
     contexts::{
         CommitMint, ConfigureRegistry, CreatePlayerAvatar, CustomizeAvatar, EquipItem,
-        MintArenaItem, RegisterArenaAsset, RegisterArenaAssetFromStellar, RevealMint,
-        ScrapArenaItem, UnequipItem,
+        EquipItemV2, MintArenaItem, RegisterArenaAsset, RegisterArenaAssetFromStellar, RevealMint,
+        ScrapArenaItem, UnequipItem, UnequipItemV2,
     },
     error::ArenaRegistryError,
     state::{
@@ -796,5 +796,88 @@ pub fn unequip_item(ctx: Context<UnequipItem>, slot: u8) -> Result<()> {
         ArenaRegistryError::InvalidEquipSlot
     );
     ctx.accounts.player_avatar.equipped[slot as usize] = Pubkey::default();
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// v2 equip ("Lineage tribute"): explicit 7-slot equipped set, the battle read.
+// ---------------------------------------------------------------------------
+
+/// Stamp the record's identity fields. Idempotent — safe on both the lazy
+/// `init_if_needed` creation and every subsequent call.
+fn touch_equipment_record(
+    record: &mut Account<crate::state::EquipmentRecord>,
+    avatar: Pubkey,
+    owner: Pubkey,
+    bump: u8,
+) {
+    record.avatar = avatar;
+    record.owner = owner;
+    record.bump = bump;
+}
+
+/// Equip an owned item NFT into an explicit v2 slot (0..6).
+///
+/// Checks, in order:
+///   1. `slot` is an active slot (< `ACTIVE_EQUIP_SLOT_COUNT`).
+///   2. The item's base type fits the slot (`allowed_in_equip_slot`: Weapon→
+///      Weapon, Head→Head, Armor→Body/Gloves/Boots, Charm→Amulet/Ring).
+///   3. The avatar card supports the governing item class (`slot_mask` bit of
+///      `base_type.slot_index()` — so slotMask semantics are unchanged).
+///   4. NFT ownership — enforced by the context (signer's ATA holds the token).
+/// Canonical slots also mirror into the legacy `PlayerAvatar::equipped` so
+/// pre-v2 readers keep working.
+pub fn equip_item_v2(ctx: Context<EquipItemV2>, slot: u8) -> Result<()> {
+    require!(
+        slot < crate::state::ACTIVE_EQUIP_SLOT_COUNT,
+        ArenaRegistryError::InvalidEquipSlot
+    );
+    let base_type = ctx.accounts.arena_item.base_type;
+    require!(
+        base_type.allowed_in_equip_slot(slot),
+        ArenaRegistryError::ItemSlotMismatch
+    );
+
+    let avatar = &mut ctx.accounts.player_avatar;
+    require!(
+        avatar.slot_mask & (1u8 << base_type.slot_index()) != 0,
+        ArenaRegistryError::InvalidEquipSlot
+    );
+
+    let mint = ctx.accounts.mint.key();
+    let record = &mut ctx.accounts.equipment_record;
+    touch_equipment_record(
+        record,
+        avatar.key(),
+        ctx.accounts.owner.key(),
+        ctx.bumps.equipment_record,
+    );
+    record.slots[slot as usize] = mint;
+
+    // Keep the legacy 4-slot view in sync for canonical slots.
+    if let Some(legacy) = crate::state::legacy_equipped_index(slot) {
+        avatar.equipped[legacy] = mint;
+    }
+    Ok(())
+}
+
+/// Clear one v2 slot (0..6) — and its legacy mirror, if the slot has one.
+pub fn unequip_item_v2(ctx: Context<UnequipItemV2>, slot: u8) -> Result<()> {
+    require!(
+        slot < crate::state::ACTIVE_EQUIP_SLOT_COUNT,
+        ArenaRegistryError::InvalidEquipSlot
+    );
+    let avatar = &mut ctx.accounts.player_avatar;
+    let record = &mut ctx.accounts.equipment_record;
+    touch_equipment_record(
+        record,
+        avatar.key(),
+        ctx.accounts.owner.key(),
+        ctx.bumps.equipment_record,
+    );
+    record.slots[slot as usize] = Pubkey::default();
+    if let Some(legacy) = crate::state::legacy_equipped_index(slot) {
+        avatar.equipped[legacy] = Pubkey::default();
+    }
     Ok(())
 }

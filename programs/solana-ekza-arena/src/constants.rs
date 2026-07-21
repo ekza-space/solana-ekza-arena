@@ -53,10 +53,10 @@ pub const REVEAL_DELAY_SLOTS: u64 = 5;
 #[constant]
 pub const COMMIT_REVEAL_WINDOW_SLOTS: u64 = 128;
 
-/// Recommended/default non-refundable commit fee (0.02 SOL). The actual value
+/// Recommended launch non-refundable commit fee (0.002 SOL). The actual value
 /// charged is governed by `ArenaRegistry::commit_fee_lamports`.
 #[constant]
-pub const COMMIT_FEE_LAMPORTS: u64 = 20_000_000;
+pub const COMMIT_FEE_LAMPORTS: u64 = 2_000_000;
 
 /// Fee and royalty basis-point denominator.
 #[constant]

@@ -52,6 +52,8 @@ pub enum ArenaRegistryError {
     InvalidSink,
     #[msg("Fee split basis points must sum to exactly 10,000.")]
     InvalidFeeSplit,
+    #[msg("A fee destination must already exist or remain rent-exempt after its fee slice is transferred.")]
+    FeeDestinationNotRentExempt,
     #[msg("The Stellar release supplied at reveal does not match the paid commit.")]
     StellarCommitMismatch,
     #[msg("The registry can only be bootstrapped by a trusted or program upgrade authority.")]

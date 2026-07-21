@@ -683,6 +683,22 @@ fn fee_slice(amount: u64, bps: u16) -> Result<u64> {
     u64::try_from(value).map_err(|_| ArenaRegistryError::NumericalOverflow.into())
 }
 
+fn require_rent_safe_fee_destination(account: &AccountInfo, amount: u64) -> Result<()> {
+    if amount == 0 {
+        return Ok(());
+    }
+    let post_transfer_lamports = account
+        .lamports()
+        .checked_add(amount)
+        .ok_or(ArenaRegistryError::NumericalOverflow)?;
+    let rent_exempt_minimum = Rent::get()?.minimum_balance(account.data_len());
+    require!(
+        post_transfer_lamports >= rent_exempt_minimum,
+        ArenaRegistryError::FeeDestinationNotRentExempt
+    );
+    Ok(())
+}
+
 /// `commit_mint` (spec §12.1): persist the intent, lock a FUTURE slot, and
 /// charge and fully distribute the non-refundable commit fee. No roll happens
 /// here. Distribution at commit is intentional: reveal may be abandoned after
@@ -733,6 +749,12 @@ pub fn commit_mint(ctx: Context<CommitMint>, args: CommitMintArgs) -> Result<()>
         .checked_sub(sink_amount)
         .and_then(|value| value.checked_sub(creator_amount))
         .ok_or(ArenaRegistryError::NumericalOverflow)?;
+
+    // A sub-rent transfer cannot create a new SystemAccount. Check both plain
+    // destinations before any CPI so a low launch fee fails with an explicit
+    // configuration error instead of the runtime's opaque rent failure.
+    require_rent_safe_fee_destination(&ctx.accounts.treasury.to_account_info(), platform_amount)?;
+    require_rent_safe_fee_destination(&ctx.accounts.sink.to_account_info(), sink_amount)?;
 
     if creator_amount > 0 {
         deposit_revenue_to_stellar(
@@ -1212,7 +1234,7 @@ mod registry_security_tests {
             configuration_authority: Pubkey::new_unique(),
             treasury: Pubkey::new_unique(),
             sink: Pubkey::new_unique(),
-            commit_fee_lamports: 20_000_000,
+            commit_fee_lamports: 2_000_000,
             creator_bps: 5_000,
             platform_bps: 4_000,
             sink_bps: 1_000,

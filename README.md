@@ -30,13 +30,17 @@ Program ID (localnet/dev): `D3a99Wj3eLLn4jbXU5rLDbaFT6giQiUbmcPkiyQSM8iZ`
   - A commit expires 128 slots after its target. Anyone may clean it up after
     expiry, but all PDA rent returns to the original minter; the fee was already
     distributed and is never refundable or held in the commit.
-- **Creator economics** — recommended fee is 0.02 SOL, governed as basis points
+- **Creator economics** — recommended launch fee is 0.002 SOL, governed as basis points
   (default 50% creator / 40% platform / 10% sink). Stellar-backed commits send
   the creator slice through `solana_stellar::deposit_revenue` to that release's
   `ReleaseVault`; Builtin/IPFS commits fold the creator slice into platform.
   Distribution happens atomically during commit, so abandoning or missing the
   reveal window cannot strand the paid fee. The Stellar release/vault/asset are
-  bound into the commit and cannot be swapped at reveal.
+  bound into the commit and cannot be swapped at reveal. The live fee is the
+  registry value and can be repriced by its configuration authority without a
+  program redeploy. Treasury and sink destinations must already exist or remain
+  rent-exempt after receiving their slice; the program reports a dedicated
+  configuration error before attempting a sub-rent transfer.
 - **Secondary royalty metadata** — item NFTs advertise 5% Metaplex royalties.
   Stellar items name the release authority as creator/distributor; other items
   name the platform treasury. This is legacy marketplace-honored metadata, not

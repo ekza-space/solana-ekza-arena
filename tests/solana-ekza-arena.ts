@@ -131,13 +131,13 @@ describe("solana-ekza-arena", () => {
   // Governed fee destinations (50% creator / 40% platform / 10% sink).
   const treasury = anchor.web3.Keypair.generate();
   const sink = anchor.web3.Keypair.generate();
-  const COMMIT_FEE_LAMPORTS = 20_000_000; // 0.02 SOL
+  const COMMIT_FEE_LAMPORTS = 2_000_000; // 0.002 SOL
   const CREATOR_BPS = 5_000;
   const PLATFORM_BPS = 4_000;
   const SINK_BPS = 1_000;
-  const CREATOR_FEE_LAMPORTS = 10_000_000;
-  const PLATFORM_FEE_LAMPORTS = 8_000_000;
-  const SINK_FEE_LAMPORTS = 2_000_000;
+  const CREATOR_FEE_LAMPORTS = 1_000_000;
+  const PLATFORM_FEE_LAMPORTS = 800_000;
+  const SINK_FEE_LAMPORTS = 200_000;
   const COMMIT_REVEAL_WINDOW_SLOTS = 128;
   let nextCommitNonce = Date.now();
 
@@ -453,7 +453,18 @@ describe("solana-ekza-arena", () => {
     ).to.equal(null);
   });
 
-  it("configures the 0.02 SOL fee and 50/40/10 split", async () => {
+  it("configures the 0.002 SOL launch fee and 50/40/10 split", async () => {
+    // At this low fee, individual slices are below the zero-data account rent
+    // minimum. Production destinations are existing wallets/incinerator-style
+    // accounts; pre-fund the generated test destinations to model that.
+    for (const destination of [treasury.publicKey, sink.publicKey]) {
+      const signature = await provider.connection.requestAirdrop(
+        destination,
+        anchor.web3.LAMPORTS_PER_SOL
+      );
+      await provider.connection.confirmTransaction(signature, "confirmed");
+    }
+
     await program.methods
       .configureRegistry({
         treasury: treasury.publicKey,
@@ -615,6 +626,73 @@ describe("solana-ekza-arena", () => {
     } catch (error) {
       expect(String(error)).to.include("Unauthorized action");
     }
+  });
+
+  it("rejects a sub-rent fee destination with a clear configuration error", async () => {
+    const emptySink = anchor.web3.Keypair.generate();
+    await program.methods
+      .configureRegistry({
+        treasury: treasury.publicKey,
+        sink: emptySink.publicKey,
+        commitFeeLamports: new anchor.BN(COMMIT_FEE_LAMPORTS),
+        creatorBps: CREATOR_BPS,
+        platformBps: PLATFORM_BPS,
+        sinkBps: SINK_BPS,
+      })
+      .accountsStrict({
+        registry: registryPda(),
+        payer: provider.wallet.publicKey,
+        arenaProgram: program.programId,
+        programData: arenaProgramData(),
+        systemProgram: anchor.web3.SystemProgram.programId,
+      })
+      .rpc();
+
+    const nonce = nextCommitNonce++;
+    try {
+      await program.methods
+        .commitMint({
+          nonce: new anchor.BN(nonce),
+          baseType: { weapon: {} },
+          skin: { builtin: [0] },
+          name: "Rent Guard",
+          symbol: "EKZAITM",
+          uri: "https://meta.ekza.space/arena/rent-guard.json",
+        })
+        .accountsStrict({
+          registry: registryPda(),
+          mintCommit: mintCommitPda(provider.wallet.publicKey, nonce),
+          minter: provider.wallet.publicKey,
+          treasury: treasury.publicKey,
+          sink: emptySink.publicKey,
+          stellarProgram: null,
+          stellarRelease: null,
+          stellarVault: null,
+          systemProgram: anchor.web3.SystemProgram.programId,
+        })
+        .rpc();
+      expect.fail("commitMint should reject a destination below rent exemption");
+    } catch (error) {
+      expect(String(error)).to.include("fee destination must already exist");
+    }
+
+    await program.methods
+      .configureRegistry({
+        treasury: treasury.publicKey,
+        sink: sink.publicKey,
+        commitFeeLamports: new anchor.BN(COMMIT_FEE_LAMPORTS),
+        creatorBps: CREATOR_BPS,
+        platformBps: PLATFORM_BPS,
+        sinkBps: SINK_BPS,
+      })
+      .accountsStrict({
+        registry: registryPda(),
+        payer: provider.wallet.publicKey,
+        arenaProgram: program.programId,
+        programData: arenaProgramData(),
+        systemProgram: anchor.web3.SystemProgram.programId,
+      })
+      .rpc();
   });
 
   it("registers a direct Arena asset record", async () => {

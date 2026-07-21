@@ -50,8 +50,10 @@ pub mod arena_leaderboard {
 
     /// Record one battle result for `player`: updates wins/losses/streaks,
     /// applies the elo-lite rating delta (+25/-20 vs player, +10/-15 vs bot,
-    /// floor 0) and upserts the player into the min-heap top list.
-    /// Signed by the player wallet OR its registered session key.
+    /// floor 0) and upserts the player into the min-heap top list. A
+    /// player-keyed throttle enforces one accepted write per slot and at most
+    /// 20 accepted writes per UTC day. Signed by the player wallet OR its
+    /// registered session key; both consume the same allowance.
     pub fn record_battle(
         ctx: Context<RecordBattle>,
         win: bool,

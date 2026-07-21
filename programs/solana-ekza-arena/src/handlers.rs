@@ -1,7 +1,8 @@
 use anchor_lang::prelude::*;
 use anchor_spl::metadata::{
     create_master_edition_v3, create_metadata_accounts_v3,
-    mpl_token_metadata::types::DataV2, CreateMasterEditionV3, CreateMetadataAccountsV3,
+    mpl_token_metadata::types::{Creator, DataV2},
+    CreateMasterEditionV3, CreateMetadataAccountsV3,
 };
 use anchor_spl::token::{mint_to, MintTo};
 
@@ -9,10 +10,13 @@ use solana_stellar::state::ReleaseStatus;
 
 use crate::{
     affix::{roll_item, roll_item_capped, RARITY_LEGENDARY},
-    constants::{MAX_BUILTIN_SKINS, RELEASE_DEPLOYMENT_PROJECT_ARENA, REVEAL_DELAY_SLOTS},
+    constants::{
+        BPS_DENOMINATOR, ITEM_ROYALTY_BPS, MAX_BUILTIN_SKINS, RELEASE_DEPLOYMENT_PROJECT_ARENA,
+        REVEAL_DELAY_SLOTS,
+    },
     contexts::{
-        CommitMint, ConfigureRegistry, CreatePlayerAvatar, CustomizeAvatar, EquipItem,
-        EquipItemV2, MintArenaItem, RegisterArenaAsset, RegisterArenaAssetFromStellar, RevealMint,
+        CommitMint, ConfigureRegistry, CreatePlayerAvatar, CustomizeAvatar, EquipItem, EquipItemV2,
+        MintArenaItem, RegisterArenaAsset, RegisterArenaAssetFromStellar, RevealMint,
         ScrapArenaItem, UnequipItem, UnequipItemV2,
     },
     error::ArenaRegistryError,
@@ -22,7 +26,7 @@ use crate::{
         ItemSkin, MintArenaItemArgs, MintSkinArg, PlayerAvatar, RegisterArenaAssetArgs,
         RegisterArenaAssetFromStellarArgs,
     },
-    utils::validate_stellar_release,
+    utils::{deposit_revenue_to_stellar, validate_stellar_release, StellarReleaseOrigin},
     utils::{
         link_arena_asset_to_stellar, record_release_deployment_to_stellar,
         validate_stellar_universe_owner,
@@ -284,23 +288,34 @@ fn slothash_of_slot(slot_hashes: &AccountInfo, target_slot: u64) -> Result<u64> 
 ///
 /// Account-based so both `mint_arena_item` and `reveal_mint` can call it with
 /// their (optional) Stellar accounts.
+struct ResolvedSkin {
+    skin_ref: ItemSkin,
+    stellar_origin: Option<StellarReleaseOrigin>,
+}
+
 fn resolve_skin_accounts<'info>(
     skin: MintSkinArg,
     stellar_program: Option<&AccountInfo<'info>>,
     stellar_release: Option<&AccountInfo<'info>>,
     stellar_vault: Option<&AccountInfo<'info>>,
-) -> Result<ItemSkin> {
+) -> Result<ResolvedSkin> {
     match skin {
         MintSkinArg::Builtin(id) => {
             require!(id < MAX_BUILTIN_SKINS, ArenaRegistryError::InvalidSkin);
-            Ok(ItemSkin::Builtin(id))
+            Ok(ResolvedSkin {
+                skin_ref: ItemSkin::Builtin(id),
+                stellar_origin: None,
+            })
         }
         MintSkinArg::Ipfs(hash) => {
             require!(
                 !hash.is_empty() && hash.len() <= ItemSkin::MAX_IPFS_LEN,
                 ArenaRegistryError::InvalidSkin
             );
-            Ok(ItemSkin::Ipfs(hash))
+            Ok(ResolvedSkin {
+                skin_ref: ItemSkin::Ipfs(hash),
+                stellar_origin: None,
+            })
         }
         MintSkinArg::Stellar => {
             let stellar_program =
@@ -310,8 +325,7 @@ fn resolve_skin_accounts<'info>(
             let stellar_vault =
                 stellar_vault.ok_or(ArenaRegistryError::MissingStellarSkinAccounts)?;
 
-            let origin =
-                validate_stellar_release(stellar_program, stellar_release, stellar_vault)?;
+            let origin = validate_stellar_release(stellar_program, stellar_release, stellar_vault)?;
             require!(
                 matches!(
                     origin.status,
@@ -319,12 +333,15 @@ fn resolve_skin_accounts<'info>(
                 ),
                 ArenaRegistryError::InvalidStellarRelease
             );
-            Ok(ItemSkin::StellarAsset(origin.asset))
+            Ok(ResolvedSkin {
+                skin_ref: ItemSkin::StellarAsset(origin.asset),
+                stellar_origin: Some(origin),
+            })
         }
     }
 }
 
-fn resolve_skin(ctx: &Context<MintArenaItem>, skin: MintSkinArg) -> Result<ItemSkin> {
+fn resolve_skin(ctx: &Context<MintArenaItem>, skin: MintSkinArg) -> Result<ResolvedSkin> {
     resolve_skin_accounts(
         skin,
         ctx.accounts.stellar_program.as_ref(),
@@ -338,7 +355,19 @@ pub fn mint_arena_item(ctx: Context<MintArenaItem>, args: MintArenaItemArgs) -> 
     validate_nft_metadata(&args.name, &args.symbol, &args.uri)?;
 
     // Resolve the skin first (and validate Stellar accounts if required).
-    let skin_ref = resolve_skin(&ctx, args.skin)?;
+    let resolved_skin = resolve_skin(&ctx, args.skin)?;
+    let royalty_recipient = resolved_skin
+        .stellar_origin
+        .as_ref()
+        .map(|origin| origin.authority)
+        .unwrap_or_else(|| {
+            if ctx.accounts.registry.treasury == Pubkey::default() {
+                ctx.accounts.payer.key()
+            } else {
+                ctx.accounts.registry.treasury
+            }
+        });
+    let skin_ref = resolved_skin.skin_ref;
 
     // Seed derivation (spec §3).
     let slothash_u64 = recent_slothash_u64(&ctx.accounts.slot_hashes)?;
@@ -373,8 +402,12 @@ pub fn mint_arena_item(ctx: Context<MintArenaItem>, args: MintArenaItemArgs) -> 
         name: args.name,
         symbol: args.symbol,
         uri: args.uri,
-        seller_fee_basis_points: 0,
-        creators: None,
+        seller_fee_basis_points: ITEM_ROYALTY_BPS,
+        creators: Some(vec![Creator {
+            address: royalty_recipient,
+            verified: royalty_recipient == ctx.accounts.payer.key(),
+            share: 100,
+        }]),
         collection: None,
         uses: None,
     };
@@ -500,22 +533,65 @@ pub fn configure_registry(
     ctx: Context<ConfigureRegistry>,
     args: ConfigureRegistryArgs,
 ) -> Result<()> {
+    let total_bps = u32::from(args.creator_bps)
+        .checked_add(u32::from(args.platform_bps))
+        .and_then(|value| value.checked_add(u32::from(args.sink_bps)))
+        .ok_or(ArenaRegistryError::NumericalOverflow)?;
+    require!(
+        total_bps == u32::from(BPS_DENOMINATOR),
+        ArenaRegistryError::InvalidFeeSplit
+    );
+    require!(
+        args.treasury != Pubkey::default(),
+        ArenaRegistryError::InvalidTreasury
+    );
+    require!(
+        args.sink != Pubkey::default(),
+        ArenaRegistryError::InvalidSink
+    );
+
     let registry = &mut ctx.accounts.registry;
+    if registry.configuration_authority == Pubkey::default() {
+        registry.configuration_authority = ctx.accounts.payer.key();
+    } else {
+        require_keys_eq!(
+            registry.configuration_authority,
+            ctx.accounts.payer.key(),
+            ArenaRegistryError::Unauthorized
+        );
+    }
     registry.bump = ctx.bumps.registry;
     registry.treasury = args.treasury;
+    registry.sink = args.sink;
     registry.commit_fee_lamports = args.commit_fee_lamports;
+    registry.creator_bps = args.creator_bps;
+    registry.platform_bps = args.platform_bps;
+    registry.sink_bps = args.sink_bps;
     Ok(())
 }
 
+fn fee_slice(amount: u64, bps: u16) -> Result<u64> {
+    let value = u128::from(amount)
+        .checked_mul(u128::from(bps))
+        .ok_or(ArenaRegistryError::NumericalOverflow)?
+        .checked_div(u128::from(BPS_DENOMINATOR))
+        .ok_or(ArenaRegistryError::NumericalOverflow)?;
+    u64::try_from(value).map_err(|_| ArenaRegistryError::NumericalOverflow.into())
+}
+
 /// `commit_mint` (spec §12.1): persist the intent, lock a FUTURE slot, and
-/// charge the non-refundable commit fee to the treasury. No roll happens here.
+/// charge and fully distribute the non-refundable commit fee. No roll happens
+/// here. Distribution at commit is intentional: reveal may be abandoned after
+/// its SlotHash expires, but no paid SOL can remain stranded in a commit PDA.
 pub fn commit_mint(ctx: Context<CommitMint>, args: CommitMintArgs) -> Result<()> {
     validate_nft_metadata(&args.name, &args.symbol, &args.uri)?;
 
     let registry = &ctx.accounts.registry;
     // The registry must have been configured with a real treasury + fee.
     require!(
-        registry.treasury != Pubkey::default(),
+        registry.configuration_authority != Pubkey::default()
+            && registry.treasury != Pubkey::default()
+            && registry.sink != Pubkey::default(),
         ArenaRegistryError::RegistryNotConfigured
     );
     require_keys_eq!(
@@ -523,24 +599,57 @@ pub fn commit_mint(ctx: Context<CommitMint>, args: CommitMintArgs) -> Result<()>
         registry.treasury,
         ArenaRegistryError::InvalidTreasury
     );
+    require_keys_eq!(
+        ctx.accounts.sink.key(),
+        registry.sink,
+        ArenaRegistryError::InvalidSink
+    );
 
-    // Validate the skin arg cheaply at commit time (Stellar accounts are not
-    // required here — they are supplied at reveal). Builtin/Ipfs are fully
-    // checked; Stellar is accepted and re-validated at reveal.
-    match &args.skin {
-        MintSkinArg::Builtin(id) => {
-            require!(*id < MAX_BUILTIN_SKINS, ArenaRegistryError::InvalidSkin)
-        }
-        MintSkinArg::Ipfs(hash) => require!(
-            !hash.is_empty() && hash.len() <= ItemSkin::MAX_IPFS_LEN,
-            ArenaRegistryError::InvalidSkin
-        ),
-        MintSkinArg::Stellar => {}
-    }
+    // Resolve and bind Stellar identity now, while `minter` can sign the
+    // permissionless deposit_revenue CPI. reveal_mint validates the same
+    // release/vault/asset again, preventing a release swap after payment.
+    let resolved_skin = resolve_skin_accounts(
+        args.skin.clone(),
+        ctx.accounts.stellar_program.as_ref(),
+        ctx.accounts.stellar_release.as_ref(),
+        ctx.accounts.stellar_vault.as_ref(),
+    )?;
 
-    // Charge the non-refundable commit fee: minter -> treasury (system transfer).
+    // Compute with u128 in fee_slice to make arbitrary governed fee values
+    // overflow-safe. Platform receives division dust, so every lamport of the
+    // configured fee is routed exactly once.
     let fee = registry.commit_fee_lamports;
-    if fee > 0 {
+    let sink_amount = fee_slice(fee, registry.sink_bps)?;
+    let creator_amount = if resolved_skin.stellar_origin.is_some() {
+        fee_slice(fee, registry.creator_bps)?
+    } else {
+        0
+    };
+    let platform_amount = fee
+        .checked_sub(sink_amount)
+        .and_then(|value| value.checked_sub(creator_amount))
+        .ok_or(ArenaRegistryError::NumericalOverflow)?;
+
+    if creator_amount > 0 {
+        deposit_revenue_to_stellar(
+            creator_amount,
+            &ctx.accounts.minter.to_account_info(),
+            ctx.accounts
+                .stellar_program
+                .as_ref()
+                .ok_or(ArenaRegistryError::MissingStellarSkinAccounts)?,
+            ctx.accounts
+                .stellar_release
+                .as_ref()
+                .ok_or(ArenaRegistryError::MissingStellarSkinAccounts)?,
+            ctx.accounts
+                .stellar_vault
+                .as_ref()
+                .ok_or(ArenaRegistryError::MissingStellarSkinAccounts)?,
+            &ctx.accounts.system_program.to_account_info(),
+        )?;
+    }
+    if platform_amount > 0 {
         anchor_lang::system_program::transfer(
             CpiContext::new(
                 ctx.accounts.system_program.to_account_info(),
@@ -549,7 +658,19 @@ pub fn commit_mint(ctx: Context<CommitMint>, args: CommitMintArgs) -> Result<()>
                     to: ctx.accounts.treasury.to_account_info(),
                 },
             ),
-            fee,
+            platform_amount,
+        )?;
+    }
+    if sink_amount > 0 {
+        anchor_lang::system_program::transfer(
+            CpiContext::new(
+                ctx.accounts.system_program.to_account_info(),
+                anchor_lang::system_program::Transfer {
+                    from: ctx.accounts.minter.to_account_info(),
+                    to: ctx.accounts.sink.to_account_info(),
+                },
+            ),
+            sink_amount,
         )?;
     }
 
@@ -567,6 +688,22 @@ pub fn commit_mint(ctx: Context<CommitMint>, args: CommitMintArgs) -> Result<()>
     commit.name = args.name;
     commit.symbol = args.symbol;
     commit.uri = args.uri;
+    if let Some(origin) = resolved_skin.stellar_origin {
+        commit.stellar_release = ctx
+            .accounts
+            .stellar_release
+            .as_ref()
+            .ok_or(ArenaRegistryError::MissingStellarSkinAccounts)?
+            .key();
+        commit.stellar_vault = origin.vault;
+        commit.stellar_asset = origin.asset;
+        commit.royalty_recipient = origin.authority;
+    } else {
+        commit.stellar_release = Pubkey::default();
+        commit.stellar_vault = Pubkey::default();
+        commit.stellar_asset = Pubkey::default();
+        commit.royalty_recipient = registry.treasury;
+    }
     commit.bump = ctx.bumps.mint_commit;
 
     Ok(())
@@ -594,12 +731,46 @@ pub fn reveal_mint(ctx: Context<RevealMint>, _nonce: u64) -> Result<()> {
     let base_type = ctx.accounts.mint_commit.base_type;
     let skin_arg = ctx.accounts.mint_commit.skin.clone();
     let rolled = roll_item(seed, base_type.to_roll());
-    let skin_ref = resolve_skin_accounts(
+    let resolved_skin = resolve_skin_accounts(
         skin_arg,
         ctx.accounts.stellar_program.as_ref(),
         ctx.accounts.stellar_release.as_ref(),
         ctx.accounts.stellar_vault.as_ref(),
     )?;
+    if let Some(origin) = resolved_skin.stellar_origin.as_ref() {
+        require_keys_eq!(
+            ctx.accounts
+                .stellar_release
+                .as_ref()
+                .ok_or(ArenaRegistryError::MissingStellarSkinAccounts)?
+                .key(),
+            ctx.accounts.mint_commit.stellar_release,
+            ArenaRegistryError::StellarCommitMismatch
+        );
+        require_keys_eq!(
+            origin.vault,
+            ctx.accounts.mint_commit.stellar_vault,
+            ArenaRegistryError::StellarCommitMismatch
+        );
+        require_keys_eq!(
+            origin.asset,
+            ctx.accounts.mint_commit.stellar_asset,
+            ArenaRegistryError::StellarCommitMismatch
+        );
+        require_keys_eq!(
+            origin.authority,
+            ctx.accounts.mint_commit.royalty_recipient,
+            ArenaRegistryError::StellarCommitMismatch
+        );
+    } else {
+        require!(
+            ctx.accounts.mint_commit.stellar_release == Pubkey::default()
+                && ctx.accounts.mint_commit.stellar_vault == Pubkey::default()
+                && ctx.accounts.mint_commit.stellar_asset == Pubkey::default(),
+            ArenaRegistryError::StellarCommitMismatch
+        );
+    }
+    let skin_ref = resolved_skin.skin_ref;
 
     // 4. Mint the real NFT (spec §11.2): supply 1, decimals 0, Master Edition.
     mint_to(
@@ -618,8 +789,12 @@ pub fn reveal_mint(ctx: Context<RevealMint>, _nonce: u64) -> Result<()> {
         name: ctx.accounts.mint_commit.name.clone(),
         symbol: ctx.accounts.mint_commit.symbol.clone(),
         uri: ctx.accounts.mint_commit.uri.clone(),
-        seller_fee_basis_points: 0,
-        creators: None,
+        seller_fee_basis_points: ITEM_ROYALTY_BPS,
+        creators: Some(vec![Creator {
+            address: ctx.accounts.mint_commit.royalty_recipient,
+            verified: ctx.accounts.mint_commit.royalty_recipient == minter,
+            share: 100,
+        }]),
         collection: None,
         uses: None,
     };

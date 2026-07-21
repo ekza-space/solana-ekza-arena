@@ -43,6 +43,41 @@ const masterEditionPda = (mint: anchor.web3.PublicKey) =>
     TOKEN_METADATA_PROGRAM_ID
   )[0];
 
+// Minimal Borsh reader for the economic fields in legacy Metaplex Metadata.
+// Avoids adding another JS dependency solely for seller_fee/creators asserts.
+const decodeMetadataEconomics = (data: Buffer) => {
+  let offset = 1 + 32 + 32; // key + update_authority + mint
+  const readString = () => {
+    const length = data.readUInt32LE(offset);
+    offset += 4 + length;
+  };
+  readString(); // name
+  readString(); // symbol
+  readString(); // uri
+  const sellerFeeBasisPoints = data.readUInt16LE(offset);
+  offset += 2;
+  const hasCreators = data.readUInt8(offset++);
+  const creators: Array<{
+    address: anchor.web3.PublicKey;
+    verified: boolean;
+    share: number;
+  }> = [];
+  if (hasCreators === 1) {
+    const length = data.readUInt32LE(offset);
+    offset += 4;
+    for (let i = 0; i < length; i++) {
+      const address = new anchor.web3.PublicKey(
+        data.subarray(offset, offset + 32)
+      );
+      offset += 32;
+      const verified = data.readUInt8(offset++) === 1;
+      const share = data.readUInt8(offset++);
+      creators.push({ address, verified, share });
+    }
+  }
+  return { sellerFeeBasisPoints, creators };
+};
+
 describe("solana-ekza-arena", () => {
   anchor.setProvider(anchor.AnchorProvider.env());
 
@@ -84,9 +119,16 @@ describe("solana-ekza-arena", () => {
       program.programId
     )[0];
 
-  // Treasury that receives the non-refundable commit fee (spec §12.1).
+  // Governed fee destinations (50% creator / 40% platform / 10% sink).
   const treasury = anchor.web3.Keypair.generate();
-  const COMMIT_FEE_LAMPORTS = 10_000_000; // 0.01 SOL
+  const sink = anchor.web3.Keypair.generate();
+  const COMMIT_FEE_LAMPORTS = 20_000_000; // 0.02 SOL
+  const CREATOR_BPS = 5_000;
+  const PLATFORM_BPS = 4_000;
+  const SINK_BPS = 1_000;
+  const CREATOR_FEE_LAMPORTS = 10_000_000;
+  const PLATFORM_FEE_LAMPORTS = 8_000_000;
+  const SINK_FEE_LAMPORTS = 2_000_000;
   let nextCommitNonce = Date.now();
 
   const waitForSlotAfter = async (target: number) => {
@@ -354,11 +396,15 @@ describe("solana-ekza-arena", () => {
     return { mint: mint.publicKey, ata, arenaItem };
   }
 
-  it("configures the registry treasury + commit fee (spec §12.1)", async () => {
+  it("configures the 0.02 SOL fee and 50/40/10 split", async () => {
     await program.methods
       .configureRegistry({
         treasury: treasury.publicKey,
+        sink: sink.publicKey,
         commitFeeLamports: new anchor.BN(COMMIT_FEE_LAMPORTS),
+        creatorBps: CREATOR_BPS,
+        platformBps: PLATFORM_BPS,
+        sinkBps: SINK_BPS,
       })
       .accountsStrict({
         registry: registryPda(),
@@ -368,12 +414,71 @@ describe("solana-ekza-arena", () => {
       .rpc();
 
     const reg = await program.account.arenaRegistry.fetch(registryPda());
+    expect(reg.configurationAuthority.toBase58()).to.equal(
+      provider.wallet.publicKey.toBase58()
+    );
     expect(reg.treasury.toBase58()).to.equal(treasury.publicKey.toBase58());
+    expect(reg.sink.toBase58()).to.equal(sink.publicKey.toBase58());
     expect(reg.commitFeeLamports.toNumber()).to.equal(COMMIT_FEE_LAMPORTS);
+    expect(reg.creatorBps).to.equal(CREATOR_BPS);
+    expect(reg.platformBps).to.equal(PLATFORM_BPS);
+    expect(reg.sinkBps).to.equal(SINK_BPS);
     console.log("E2E_PROOF registry_treasury=" + reg.treasury.toBase58());
     console.log(
-      "E2E_PROOF registry_commit_fee_lamports=" + reg.commitFeeLamports.toString()
+      "E2E_PROOF registry_commit_fee_lamports=" +
+        reg.commitFeeLamports.toString()
     );
+  });
+
+  it("rejects an invalid fee split and unauthorized reconfiguration", async () => {
+    try {
+      await program.methods
+        .configureRegistry({
+          treasury: treasury.publicKey,
+          sink: sink.publicKey,
+          commitFeeLamports: new anchor.BN(COMMIT_FEE_LAMPORTS),
+          creatorBps: 5_000,
+          platformBps: 5_000,
+          sinkBps: 1,
+        })
+        .accountsStrict({
+          registry: registryPda(),
+          payer: provider.wallet.publicKey,
+          systemProgram: anchor.web3.SystemProgram.programId,
+        })
+        .rpc();
+      expect.fail("configureRegistry should reject a split above 10,000 bps");
+    } catch (error) {
+      expect(String(error)).to.include("sum to exactly 10,000");
+    }
+
+    const attacker = anchor.web3.Keypair.generate();
+    const airdrop = await provider.connection.requestAirdrop(
+      attacker.publicKey,
+      anchor.web3.LAMPORTS_PER_SOL
+    );
+    await provider.connection.confirmTransaction(airdrop, "confirmed");
+    try {
+      await program.methods
+        .configureRegistry({
+          treasury: attacker.publicKey,
+          sink: sink.publicKey,
+          commitFeeLamports: new anchor.BN(COMMIT_FEE_LAMPORTS),
+          creatorBps: CREATOR_BPS,
+          platformBps: PLATFORM_BPS,
+          sinkBps: SINK_BPS,
+        })
+        .accountsStrict({
+          registry: registryPda(),
+          payer: attacker.publicKey,
+          systemProgram: anchor.web3.SystemProgram.programId,
+        })
+        .signers([attacker])
+        .rpc();
+      expect.fail("configureRegistry should reject a non-authority signer");
+    } catch (error) {
+      expect(String(error)).to.include("Unauthorized action");
+    }
   });
 
   it("registers a direct Arena asset record", async () => {
@@ -537,12 +642,21 @@ describe("solana-ekza-arena", () => {
     expect(ataInfo.owner.equals(provider.wallet.publicKey)).to.equal(true);
 
     // Metadata account exists with the supplied name/uri.
-    const metaInfo = await provider.connection.getAccountInfo(metadataPda(mint));
+    const metaInfo = await provider.connection.getAccountInfo(
+      metadataPda(mint)
+    );
     expect(metaInfo).to.not.equal(null);
     expect(metaInfo!.owner.equals(TOKEN_METADATA_PROGRAM_ID)).to.equal(true);
     const metaStr = metaInfo!.data.toString("utf8");
     expect(metaStr).to.include("Ekza Weapon #1");
     expect(metaStr).to.include("weapon-1.json");
+    const economics = decodeMetadataEconomics(metaInfo!.data);
+    expect(economics.sellerFeeBasisPoints).to.equal(500);
+    expect(economics.creators).to.have.length(1);
+    expect(economics.creators[0].address.toBase58()).to.equal(
+      treasury.publicKey.toBase58()
+    );
+    expect(economics.creators[0].share).to.equal(100);
 
     // Master Edition exists (true 1-of-1 non-fungible).
     const meInfo = await provider.connection.getAccountInfo(
@@ -585,15 +699,24 @@ describe("solana-ekza-arena", () => {
     });
 
     console.log("E2E_PROOF stellar_skin_nft_mint=" + mint.toBase58());
-    console.log(
-      "E2E_PROOF stellar_skin_asset=" + stellar.asset.toBase58()
-    );
+    console.log("E2E_PROOF stellar_skin_asset=" + stellar.asset.toBase58());
 
     // NFT really minted with stats.
     const mintInfo = await getMint(provider.connection, mint);
     expect(mintInfo.supply.toString()).to.equal("1");
     const ataInfo = await getAccount(provider.connection, ata);
     expect(ataInfo.amount.toString()).to.equal("1");
+
+    const metaInfo = await provider.connection.getAccountInfo(
+      metadataPda(mint)
+    );
+    const economics = decodeMetadataEconomics(metaInfo!.data);
+    expect(economics.sellerFeeBasisPoints).to.equal(500);
+    expect(economics.creators).to.have.length(1);
+    // The finalized release authority is the royalty recipient/distributor.
+    expect(economics.creators[0].address.toBase58()).to.equal(
+      provider.wallet.publicKey.toBase58()
+    );
 
     const itemAccount = await program.account.arenaItem.fetch(arenaItem);
     // skin_ref points at the validated Stellar asset pubkey.
@@ -613,7 +736,9 @@ describe("solana-ekza-arena", () => {
         baseType: { charm: {} },
         skin: { builtin: [200] }, // >= MAX_BUILTIN_SKINS (64)
       });
-      expect.fail("mintArenaItem should reject an out-of-range builtin skin id");
+      expect.fail(
+        "mintArenaItem should reject an out-of-range builtin skin id"
+      );
     } catch (error) {
       expect(String(error)).to.include("Invalid item skin reference");
     }
@@ -663,7 +788,9 @@ describe("solana-ekza-arena", () => {
     expect(newInfo.amount.toString()).to.equal("1");
     expect(newInfo.owner.equals(buyer.publicKey)).to.equal(true);
 
-    console.log("E2E_PROOF transfer_old_owner=" + provider.wallet.publicKey.toBase58());
+    console.log(
+      "E2E_PROOF transfer_old_owner=" + provider.wallet.publicKey.toBase58()
+    );
     console.log("E2E_PROOF transfer_new_owner=" + buyer.publicKey.toBase58());
     console.log("E2E_PROOF transfer_mint=" + mint.toBase58());
 
@@ -737,7 +864,7 @@ describe("solana-ekza-arena", () => {
     console.log("E2E_PROOF burned_and_closed_mint=" + mint.toBase58());
   });
 
-  it("commit_mint charges the non-refundable fee to treasury + creates the MintCommit PDA (spec §12.1)", async () => {
+  it("commit_mint folds non-Stellar creator share into platform and strands no fee", async () => {
     const minter = provider.wallet.publicKey;
     const nonce = nextCommitNonce++;
     const commitPda = mintCommitPda(minter, nonce);
@@ -746,6 +873,7 @@ describe("solana-ekza-arena", () => {
     const treasuryBefore = await provider.connection.getBalance(
       treasury.publicKey
     );
+    const sinkBefore = await provider.connection.getBalance(sink.publicKey);
 
     await program.methods
       .commitMint({
@@ -761,16 +889,25 @@ describe("solana-ekza-arena", () => {
         mintCommit: commitPda,
         minter,
         treasury: treasury.publicKey,
+        sink: sink.publicKey,
+        stellarProgram: null,
+        stellarRelease: null,
+        stellarVault: null,
         systemProgram: anchor.web3.SystemProgram.programId,
       })
       .rpc();
 
-    // Fee left the payer and arrived at the treasury, exactly.
+    // Builtin/IPFS have no creator, so 50% creator folds into platform:
+    // 90% platform, 10% sink. Nothing waits for reveal.
     const treasuryAfter = await provider.connection.getBalance(
       treasury.publicKey
     );
+    const sinkAfter = await provider.connection.getBalance(sink.publicKey);
     const payerAfter = await provider.connection.getBalance(minter);
-    expect(treasuryAfter - treasuryBefore).to.equal(COMMIT_FEE_LAMPORTS);
+    expect(treasuryAfter - treasuryBefore).to.equal(
+      CREATOR_FEE_LAMPORTS + PLATFORM_FEE_LAMPORTS
+    );
+    expect(sinkAfter - sinkBefore).to.equal(SINK_FEE_LAMPORTS);
     // Payer paid the fee + the commit-account rent + tx fee.
     expect(payerBefore - payerAfter).to.be.greaterThan(COMMIT_FEE_LAMPORTS);
 
@@ -779,12 +916,149 @@ describe("solana-ekza-arena", () => {
     expect(commit.nonce.toNumber()).to.equal(nonce);
     expect(commit.targetSlot.toNumber()).to.be.greaterThan(0);
     expect(commit.baseType).to.deep.equal({ weapon: {} });
+    expect(
+      commit.stellarRelease.equals(anchor.web3.PublicKey.default)
+    ).to.equal(true);
+    expect(commit.royaltyRecipient.toBase58()).to.equal(
+      treasury.publicKey.toBase58()
+    );
+    const commitInfo = await provider.connection.getAccountInfo(commitPda);
+    const rentOnly =
+      await provider.connection.getMinimumBalanceForRentExemption(
+        commitInfo!.data.length
+      );
+    expect(commitInfo!.lamports).to.equal(rentOnly);
 
     console.log("E2E_PROOF commit_pda=" + commitPda.toBase58());
     console.log("E2E_PROOF commit_target_slot=" + commit.targetSlot.toString());
     console.log(
-      "E2E_PROOF commit_fee_to_treasury=" + (treasuryAfter - treasuryBefore)
+      "E2E_PROOF commit_fee_to_platform=" + (treasuryAfter - treasuryBefore)
     );
+  });
+
+  it("commit_mint deposits Stellar creator share immediately through CPI", async () => {
+    const stellar = await createFinalizedStellarRelease("ArenaMintRevenue");
+    const minter = provider.wallet.publicKey;
+    const nonce = nextCommitNonce++;
+    const commitPda = mintCommitPda(minter, nonce);
+    const releaseBefore = await stellarAccounts.release.fetch(stellar.release);
+    const vaultBefore = await provider.connection.getBalance(stellar.vault);
+    const treasuryBefore = await provider.connection.getBalance(
+      treasury.publicKey
+    );
+    const sinkBefore = await provider.connection.getBalance(sink.publicKey);
+
+    await program.methods
+      .commitMint({
+        nonce: new anchor.BN(nonce),
+        baseType: { armor: {} },
+        skin: { stellar: {} },
+        name: "Ekza Creator Armor",
+        symbol: "EKZAITM",
+        uri: "https://meta.ekza.space/arena/creator-armor.json",
+      })
+      .accountsStrict({
+        registry: registryPda(),
+        mintCommit: commitPda,
+        minter,
+        treasury: treasury.publicKey,
+        sink: sink.publicKey,
+        stellarProgram: STELLAR_PROGRAM_ID,
+        stellarRelease: stellar.release,
+        stellarVault: stellar.vault,
+        systemProgram: anchor.web3.SystemProgram.programId,
+      })
+      .rpc();
+
+    const releaseAfter = await stellarAccounts.release.fetch(stellar.release);
+    const vaultAfter = await provider.connection.getBalance(stellar.vault);
+    const treasuryAfter = await provider.connection.getBalance(
+      treasury.publicKey
+    );
+    const sinkAfter = await provider.connection.getBalance(sink.publicKey);
+    expect(
+      releaseAfter.totalDepositedLamports
+        .sub(releaseBefore.totalDepositedLamports)
+        .toNumber()
+    ).to.equal(CREATOR_FEE_LAMPORTS);
+    expect(vaultAfter - vaultBefore).to.equal(CREATOR_FEE_LAMPORTS);
+    expect(treasuryAfter - treasuryBefore).to.equal(PLATFORM_FEE_LAMPORTS);
+    expect(sinkAfter - sinkBefore).to.equal(SINK_FEE_LAMPORTS);
+
+    const commit = await program.account.mintCommit.fetch(commitPda);
+    expect(commit.stellarRelease.toBase58()).to.equal(
+      stellar.release.toBase58()
+    );
+    expect(commit.stellarVault.toBase58()).to.equal(stellar.vault.toBase58());
+    expect(commit.stellarAsset.toBase58()).to.equal(stellar.asset.toBase58());
+    expect(commit.royaltyRecipient.toBase58()).to.equal(minter.toBase58());
+    const commitInfo = await provider.connection.getAccountInfo(commitPda);
+    const rentOnly =
+      await provider.connection.getMinimumBalanceForRentExemption(
+        commitInfo!.data.length
+      );
+    expect(commitInfo!.lamports).to.equal(rentOnly);
+    console.log(
+      "E2E_PROOF stellar_creator_fee_to_vault=" +
+        CREATOR_FEE_LAMPORTS.toString()
+    );
+
+    // A different valid finalized release cannot be substituted after the
+    // creator cut has been paid. The failed reveal is atomic, so the same mint
+    // can then reveal against the release bound in MintCommit.
+    const wrongStellar = await createFinalizedStellarRelease(
+      "ArenaWrongMintRevenue"
+    );
+    await waitForSlotAfter(commit.targetSlot.toNumber());
+    const mint = anchor.web3.Keypair.generate();
+    const arenaItem = arenaItemPda(mint.publicKey);
+    const commonRevealAccounts = {
+      registry: registryPda(),
+      mintCommit: commitPda,
+      mint: mint.publicKey,
+      arenaItem,
+      minterTokenAccount: getAssociatedTokenAddressSync(mint.publicKey, minter),
+      minter,
+      slotHashes: SLOT_HASHES_SYSVAR,
+      metadataAccount: metadataPda(mint.publicKey),
+      masterEdition: masterEditionPda(mint.publicKey),
+      stellarProgram: STELLAR_PROGRAM_ID,
+      tokenMetadataProgram: TOKEN_METADATA_PROGRAM_ID,
+      tokenProgram: TOKEN_PROGRAM_ID,
+      associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+      systemProgram: anchor.web3.SystemProgram.programId,
+      rent: anchor.web3.SYSVAR_RENT_PUBKEY,
+    };
+    try {
+      await program.methods
+        .revealMint(new anchor.BN(nonce))
+        .accountsStrict({
+          ...commonRevealAccounts,
+          stellarRelease: wrongStellar.release,
+          stellarVault: wrongStellar.vault,
+        })
+        .signers([mint])
+        .rpc();
+      expect.fail("revealMint should reject a substituted Stellar release");
+    } catch (error) {
+      expect(String(error)).to.include("does not match the paid commit");
+    }
+
+    await program.methods
+      .revealMint(new anchor.BN(nonce))
+      .accountsStrict({
+        ...commonRevealAccounts,
+        stellarRelease: stellar.release,
+        stellarVault: stellar.vault,
+      })
+      .signers([mint])
+      .rpc();
+    const item = await program.account.arenaItem.fetch(arenaItem);
+    expect(item.skinRef.stellarAsset[0].toBase58()).to.equal(
+      stellar.asset.toBase58()
+    );
+    expect(await provider.connection.getAccountInfo(commitPda)).to.equal(null);
+    console.log("E2E_PROOF stellar_release_swap_rejected=true");
   });
 
   it("reveal_mint: rejected BEFORE target slot, then mints NFT + ArenaItem and closes the commit (spec §12.1)", async () => {
@@ -806,6 +1080,10 @@ describe("solana-ekza-arena", () => {
         mintCommit: commitPda,
         minter,
         treasury: treasury.publicKey,
+        sink: sink.publicKey,
+        stellarProgram: null,
+        stellarRelease: null,
+        stellarVault: null,
         systemProgram: anchor.web3.SystemProgram.programId,
       })
       .rpc();
@@ -850,7 +1128,9 @@ describe("solana-ekza-arena", () => {
       expect(String(error)).to.include("Reveal attempted before");
     }
     expect(earlyRejected).to.equal(true);
-    console.log("E2E_PROOF reveal_early_rejected=true target_slot=" + targetSlot);
+    console.log(
+      "E2E_PROOF reveal_early_rejected=true target_slot=" + targetSlot
+    );
 
     // Advance past the target slot, then reveal succeeds (single-shot).
     await waitForSlotAfter(targetSlot);
@@ -866,6 +1146,15 @@ describe("solana-ekza-arena", () => {
     expect(mintInfo.decimals).to.equal(0);
     const ataInfo = await getAccount(provider.connection, ata);
     expect(ataInfo.amount.toString()).to.equal("1");
+
+    const revealMetadata = await provider.connection.getAccountInfo(
+      metadataPda(mint.publicKey)
+    );
+    const revealEconomics = decodeMetadataEconomics(revealMetadata!.data);
+    expect(revealEconomics.sellerFeeBasisPoints).to.equal(500);
+    expect(revealEconomics.creators[0].address.toBase58()).to.equal(
+      treasury.publicKey.toBase58()
+    );
 
     // ArenaItem written with rolled stats + forward-compat defaults (spec §12.3).
     const item = await program.account.arenaItem.fetch(arenaItem);
@@ -901,7 +1190,9 @@ describe("solana-ekza-arena", () => {
       expect(item.enhanceLevel).to.equal(0);
       expect(item.sockets.length).to.equal(0);
     }
-    console.log("E2E_PROOF mint_arena_item_clamped_never_mythic=true (6 samples)");
+    console.log(
+      "E2E_PROOF mint_arena_item_clamped_never_mythic=true (6 samples)"
+    );
   });
 
   it("rejects Arena assets without an equip slot mask", async () => {
@@ -986,7 +1277,14 @@ describe("solana-ekza-arena", () => {
       return { mint, ata: destAta, arenaItem: arenaItemPda(mint) };
     };
 
-    const equip = (owner: anchor.web3.Keypair, item: { mint: anchor.web3.PublicKey; ata: anchor.web3.PublicKey; arenaItem: anchor.web3.PublicKey }) =>
+    const equip = (
+      owner: anchor.web3.Keypair,
+      item: {
+        mint: anchor.web3.PublicKey;
+        ata: anchor.web3.PublicKey;
+        arenaItem: anchor.web3.PublicKey;
+      }
+    ) =>
       program.methods
         .equipItem()
         .accountsStrict({
@@ -1074,7 +1372,11 @@ describe("solana-ekza-arena", () => {
     });
 
     it("equips an owned item NFT into its base-type slot", async () => {
-      const weapon = await mintItemTo(avatarOwner, { weapon: {} }, "Equip Sword");
+      const weapon = await mintItemTo(
+        avatarOwner,
+        { weapon: {} },
+        "Equip Sword"
+      );
       await equip(avatarOwner, weapon);
 
       const avatar = await program.account.playerAvatar.fetch(
@@ -1086,7 +1388,11 @@ describe("solana-ekza-arena", () => {
 
     it("rejects equipping into a slot the avatar card does not support", async () => {
       // avatarCard slotMask = 3 (weapon+head): Armor (slot 2) must be rejected.
-      const armor = await mintItemTo(avatarOwner, { armor: {} }, "Illegal Plate");
+      const armor = await mintItemTo(
+        avatarOwner,
+        { armor: {} },
+        "Illegal Plate"
+      );
       try {
         await equip(avatarOwner, armor);
         expect.fail("equipItem should reject an unsupported slot");
@@ -1109,12 +1415,7 @@ describe("solana-ekza-arena", () => {
           secondOwner.publicKey,
           head.mint
         ),
-        createTransferInstruction(
-          head.ata,
-          destAta,
-          avatarOwner.publicKey,
-          1
-        )
+        createTransferInstruction(head.ata, destAta, avatarOwner.publicKey, 1)
       );
       await provider.sendAndConfirm(tx, [avatarOwner]);
 
@@ -1192,7 +1493,11 @@ describe("solana-ekza-arena", () => {
     it("swaps the base Avatar card: slot mask updates, equips clear", async () => {
       const pda = playerAvatarPda(avatarOwner.publicKey);
       // Re-equip something first so the clear is observable.
-      const weapon = await mintItemTo(avatarOwner, { weapon: {} }, "Swap Sword");
+      const weapon = await mintItemTo(
+        avatarOwner,
+        { weapon: {} },
+        "Swap Sword"
+      );
       await equip(avatarOwner, weapon);
 
       await program.methods
@@ -1274,12 +1579,24 @@ describe("solana-ekza-arena", () => {
 
       // avatarOwner now wears the fullCard (slotMask 15) from the swap test.
       it("equips the full 7-slot set (Armor→Body/Gloves/Boots, Charm→Amulet/Ring)", async () => {
-        const weapon = await mintItemTo(avatarOwner, { weapon: {} }, "V2 Sword");
+        const weapon = await mintItemTo(
+          avatarOwner,
+          { weapon: {} },
+          "V2 Sword"
+        );
         const head = await mintItemTo(avatarOwner, { head: {} }, "V2 Helm");
         const body = await mintItemTo(avatarOwner, { armor: {} }, "V2 Plate");
-        const gloves = await mintItemTo(avatarOwner, { armor: {} }, "V2 Gloves");
+        const gloves = await mintItemTo(
+          avatarOwner,
+          { armor: {} },
+          "V2 Gloves"
+        );
         const boots = await mintItemTo(avatarOwner, { armor: {} }, "V2 Boots");
-        const amulet = await mintItemTo(avatarOwner, { charm: {} }, "V2 Amulet");
+        const amulet = await mintItemTo(
+          avatarOwner,
+          { charm: {} },
+          "V2 Amulet"
+        );
         const ring = await mintItemTo(avatarOwner, { charm: {} }, "V2 Ring");
 
         await equipV2(avatarOwner, weapon, SLOT.Weapon);
@@ -1344,7 +1661,11 @@ describe("solana-ekza-arena", () => {
       });
 
       it("rejects reserved/out-of-range slots (7..)", async () => {
-        const weapon = await mintItemTo(avatarOwner, { weapon: {} }, "Slot Nine");
+        const weapon = await mintItemTo(
+          avatarOwner,
+          { weapon: {} },
+          "Slot Nine"
+        );
         try {
           await equipV2(avatarOwner, weapon, 9);
           expect.fail("equipItemV2 should reject slot 9");
@@ -1376,7 +1697,11 @@ describe("solana-ekza-arena", () => {
       });
 
       it("rejects v2 equip after the NFT was traded away (holder rule)", async () => {
-        const ring = await mintItemTo(avatarOwner, { charm: {} }, "Traded Ring");
+        const ring = await mintItemTo(
+          avatarOwner,
+          { charm: {} },
+          "Traded Ring"
+        );
         const destAta = getAssociatedTokenAddressSync(
           ring.mint,
           secondOwner.publicKey
@@ -1388,12 +1713,7 @@ describe("solana-ekza-arena", () => {
             secondOwner.publicKey,
             ring.mint
           ),
-          createTransferInstruction(
-            ring.ata,
-            destAta,
-            avatarOwner.publicKey,
-            1
-          )
+          createTransferInstruction(ring.ata, destAta, avatarOwner.publicKey, 1)
         );
         await provider.sendAndConfirm(tx, [avatarOwner]);
 

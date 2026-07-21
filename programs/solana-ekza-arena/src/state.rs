@@ -81,9 +81,7 @@ impl ArenaBaseType {
         match slot {
             EQUIP_SLOT_WEAPON => self == ArenaBaseType::Weapon,
             EQUIP_SLOT_HEAD => self == ArenaBaseType::Head,
-            EQUIP_SLOT_BODY | EQUIP_SLOT_GLOVES | EQUIP_SLOT_BOOTS => {
-                self == ArenaBaseType::Armor
-            }
+            EQUIP_SLOT_BODY | EQUIP_SLOT_GLOVES | EQUIP_SLOT_BOOTS => self == ArenaBaseType::Armor,
             EQUIP_SLOT_AMULET | EQUIP_SLOT_RING => self == ArenaBaseType::Charm,
             _ => false,
         }
@@ -241,23 +239,42 @@ impl MintArenaItemArgs {
 #[account]
 pub struct ArenaRegistry {
     pub next_index: u64,
-    /// Destination of the non-refundable commit fee (spec §12.1). Set by
-    /// `configure_registry`; default (all-zero) until configured.
+    /// First successful configure claims authority; all later reconfiguration
+    /// must be signed by the same wallet.
+    pub configuration_authority: Pubkey,
+    /// Destination of the platform slice of the non-refundable commit fee.
     pub treasury: Pubkey,
-    /// Non-refundable fee charged at `commit_mint`, in lamports (spec §12.1).
+    /// Destination of the protocol-sink slice.
+    pub sink: Pubkey,
+    /// Non-refundable fee charged at `commit_mint`, in lamports.
     pub commit_fee_lamports: u64,
+    pub creator_bps: u16,
+    pub platform_bps: u16,
+    pub sink_bps: u16,
     pub bump: u8,
 }
 
 impl ArenaRegistry {
-    pub const INIT_SPACE: usize = 8 + 32 + 8 + 1;
+    pub const INIT_SPACE: usize = 8 // next_index
+        + 32 // configuration_authority
+        + 32 // treasury
+        + 32 // sink
+        + 8 // commit_fee_lamports
+        + 2 // creator_bps
+        + 2 // platform_bps
+        + 2 // sink_bps
+        + 1; // bump
 }
 
-/// Args for `configure_registry` — set the treasury + commit fee (spec §12.1).
+/// Args for `configure_registry` — set fee destinations and the complete split.
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug, PartialEq, Eq)]
 pub struct ConfigureRegistryArgs {
     pub treasury: Pubkey,
+    pub sink: Pubkey,
     pub commit_fee_lamports: u64,
+    pub creator_bps: u16,
+    pub platform_bps: u16,
+    pub sink_bps: u16,
 }
 
 #[account]
@@ -552,6 +569,14 @@ pub struct MintCommit {
     pub name: String,
     pub symbol: String,
     pub uri: String,
+    /// Stellar identity bound and paid at commit time. All-zero for a
+    /// Builtin/IPFS skin. Binding it prevents swapping releases at reveal.
+    pub stellar_release: Pubkey,
+    pub stellar_vault: Pubkey,
+    pub stellar_asset: Pubkey,
+    /// Metaplex royalty recipient selected at commit: Stellar release
+    /// authority for creator-backed skins, platform treasury otherwise.
+    pub royalty_recipient: Pubkey,
     pub bump: u8,
 }
 
@@ -566,5 +591,9 @@ impl MintCommit {
         + 4 + MintArenaItemArgs::MAX_NAME_LEN
         + 4 + MintArenaItemArgs::MAX_SYMBOL_LEN
         + 4 + MintArenaItemArgs::MAX_URI_LEN
+        + 32 // stellar_release
+        + 32 // stellar_vault
+        + 32 // stellar_asset
+        + 32 // royalty_recipient
         + 1; // bump
 }

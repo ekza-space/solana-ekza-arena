@@ -1,6 +1,11 @@
 use anchor_lang::prelude::*;
 
-use crate::constants::MAX_CAPACITY;
+use crate::{
+    constants::{
+        MAX_BATTLES_PER_UTC_DAY, MAX_CAPACITY, MIN_BATTLE_COOLDOWN_SLOTS, SECONDS_PER_DAY,
+    },
+    error::LeaderboardError,
+};
 
 // ---------------------------------------------------------------------------
 // Leaderboard: fixed-size binary MIN-heap over player ratings (zero-copy).
@@ -119,6 +124,7 @@ impl Leaderboard {
     ///   3. board full            -> evict the root (the weakest of the top)
     ///      iff the new rating strictly beats it, then sift down from the
     ///      root. Ties lose to the incumbent.
+    ///
     /// Returns true when the player holds a slot after the call.
     pub fn upsert(&mut self, player: Pubkey, rating: i32, wins: u32) -> bool {
         if let Some(i) = self.find(&player) {
@@ -128,7 +134,11 @@ impl Leaderboard {
             self.sift_down(i);
             return true;
         }
-        let entry = HeapEntry { player, rating, wins };
+        let entry = HeapEntry {
+            player,
+            rating,
+            wins,
+        };
         if (self.size as usize) < self.capacity as usize {
             let i = self.size as usize;
             self.entries[i] = entry;
@@ -190,4 +200,144 @@ impl PlayerStats {
         + Self::MAX_NAME_LEN
         + Self::MAX_URI_LEN
         + 1; // bump
+}
+
+// ---------------------------------------------------------------------------
+// Per-player anti-farming state (separate PDA for PlayerStats compatibility).
+// ---------------------------------------------------------------------------
+
+/// One per wallet: `["battle_rate_limit_v1", player]`.
+///
+/// This state is deliberately keyed by the player, not the transaction signer:
+/// owner- and session-key-signed battles consume the same cooldown and daily
+/// allowance. Session rotation therefore cannot reset either limit.
+#[account]
+pub struct BattleRateLimit {
+    pub player: Pubkey,
+    /// Slot of the most recently accepted battle.
+    pub last_battle_slot: u64,
+    /// `Clock.unix_timestamp / 86_400` for the active counter window.
+    pub utc_day: i64,
+    pub battles_today: u16,
+    /// Explicit first-use marker; slot 0 remains a valid first battle slot.
+    pub has_recorded_battle: bool,
+    pub bump: u8,
+}
+
+impl BattleRateLimit {
+    pub const INIT_SPACE: usize = 32 // player
+        + 8 // last_battle_slot
+        + 8 // utc_day
+        + 2 // battles_today
+        + 1 // has_recorded_battle
+        + 1; // bump
+
+    /// Initialize only a newly-created zeroed PDA. Calling this for an
+    /// existing account (including after session-key rotation) preserves the
+    /// accumulated allowance.
+    pub fn initialize_if_needed(&mut self, player: Pubkey, bump: u8) {
+        if self.player == Pubkey::default() {
+            self.player = player;
+            self.bump = bump;
+        }
+    }
+
+    /// Validate and consume one battle allowance. This runs before any player
+    /// stats or heap mutation; an error therefore leaves every account intact.
+    pub fn consume(&mut self, slot: u64, unix_timestamp: i64) -> Result<()> {
+        if self.has_recorded_battle {
+            let first_allowed_slot = self
+                .last_battle_slot
+                .checked_add(MIN_BATTLE_COOLDOWN_SLOTS)
+                .ok_or(LeaderboardError::NumericalOverflow)?;
+            require!(
+                slot >= first_allowed_slot,
+                LeaderboardError::BattleCooldownActive
+            );
+        }
+
+        let current_utc_day = unix_timestamp.div_euclid(SECONDS_PER_DAY);
+        if !self.has_recorded_battle || current_utc_day > self.utc_day {
+            self.utc_day = current_utc_day;
+            self.battles_today = 0;
+        }
+        // A rare backwards Clock adjustment must never grant a fresh quota:
+        // retain the latest observed day/counter until time catches up.
+
+        require!(
+            self.battles_today < MAX_BATTLES_PER_UTC_DAY,
+            LeaderboardError::DailyBattleLimitReached
+        );
+
+        self.battles_today = self
+            .battles_today
+            .checked_add(1)
+            .ok_or(LeaderboardError::NumericalOverflow)?;
+        self.last_battle_slot = slot;
+        self.has_recorded_battle = true;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod rate_limit_tests {
+    use super::*;
+
+    fn limiter() -> BattleRateLimit {
+        let player = Pubkey::new_unique();
+        let mut limiter = BattleRateLimit {
+            player: Pubkey::default(),
+            last_battle_slot: 0,
+            utc_day: 0,
+            battles_today: 0,
+            has_recorded_battle: false,
+            bump: 0,
+        };
+        limiter.initialize_if_needed(player, 255);
+        limiter
+    }
+
+    #[test]
+    fn first_battle_at_slot_zero_is_allowed_then_same_slot_is_blocked() {
+        let mut limiter = limiter();
+        limiter.consume(0, 100).unwrap();
+        assert!(limiter.consume(0, 100).is_err());
+        limiter.consume(MIN_BATTLE_COOLDOWN_SLOTS, 100).unwrap();
+        assert_eq!(limiter.battles_today, 2);
+    }
+
+    #[test]
+    fn utc_day_rollover_resets_quota_but_clock_rollback_does_not() {
+        let mut limiter = limiter();
+        let day = 20_000i64;
+        for i in 0..MAX_BATTLES_PER_UTC_DAY {
+            limiter
+                .consume(i as u64 * MIN_BATTLE_COOLDOWN_SLOTS, day * SECONDS_PER_DAY)
+                .unwrap();
+        }
+        assert!(limiter
+            .consume(
+                MAX_BATTLES_PER_UTC_DAY as u64 * MIN_BATTLE_COOLDOWN_SLOTS,
+                day * SECONDS_PER_DAY
+            )
+            .is_err());
+
+        // Moving backwards must retain the exhausted quota.
+        assert!(limiter
+            .consume(
+                (MAX_BATTLES_PER_UTC_DAY as u64 + 1) * MIN_BATTLE_COOLDOWN_SLOTS,
+                (day - 1) * SECONDS_PER_DAY
+            )
+            .is_err());
+
+        // The next real UTC day grants a fresh quota.
+        limiter
+            .consume(
+                (MAX_BATTLES_PER_UTC_DAY as u64 + 2) * MIN_BATTLE_COOLDOWN_SLOTS,
+                (day + 1) * SECONDS_PER_DAY,
+            )
+            .unwrap();
+        assert_eq!(limiter.utc_day, day + 1);
+        assert_eq!(limiter.battles_today, 1);
+    }
 }

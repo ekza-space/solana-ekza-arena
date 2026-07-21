@@ -7,7 +7,7 @@ use crate::{
     },
     contexts::{InitLeaderboard, RecordBattle, RegisterSessionKey, RevokeSessionKey, SetProfile},
     error::LeaderboardError,
-    state::PlayerStats,
+    state::{BattleRateLimit, PlayerStats},
 };
 
 /// A `PlayerStats` fresh out of `init_if_needed` is all-zero; recognize it by
@@ -18,6 +18,15 @@ fn ensure_stats_initialized(stats: &mut PlayerStats, player: Pubkey, bump: u8) {
         stats.rating = STARTING_RATING;
         stats.bump = bump;
     }
+}
+
+fn ensure_rate_limit_initialized(rate_limit: &mut BattleRateLimit, player: Pubkey, bump: u8) {
+    rate_limit.initialize_if_needed(player, bump);
+}
+
+#[inline]
+fn apply_rating_delta(rating: i32, delta: i32) -> i32 {
+    rating.saturating_add(delta).max(RATING_FLOOR)
 }
 
 pub fn init_leaderboard(ctx: Context<InitLeaderboard>, capacity: u16) -> Result<()> {
@@ -39,6 +48,11 @@ pub fn init_leaderboard(ctx: Context<InitLeaderboard>, capacity: u16) -> Result<
 pub fn register_session_key(ctx: Context<RegisterSessionKey>, session_key: Pubkey) -> Result<()> {
     let stats = &mut ctx.accounts.player_stats;
     ensure_stats_initialized(stats, ctx.accounts.player.key(), ctx.bumps.player_stats);
+    ensure_rate_limit_initialized(
+        &mut ctx.accounts.battle_rate_limit,
+        ctx.accounts.player.key(),
+        ctx.bumps.battle_rate_limit,
+    );
     stats.session_key = Some(session_key);
     Ok(())
 }
@@ -60,6 +74,14 @@ pub fn record_battle(ctx: Context<RecordBattle>, win: bool, opponent_is_bot: boo
         signer == stats.player || stats.session_key == Some(signer),
         LeaderboardError::SessionKeyMismatch
     );
+
+    // Both authorization paths consume the same player-keyed allowance. The
+    // throttle PDA is created by the wallet during session registration, or
+    // lazily by the signer for a direct owner-signed first battle.
+    let rate_limit = &mut ctx.accounts.battle_rate_limit;
+    ensure_rate_limit_initialized(rate_limit, player, ctx.bumps.battle_rate_limit);
+    let clock = Clock::get()?;
+    rate_limit.consume(clock.slot, clock.unix_timestamp)?;
 
     // Battle tally + streaks.
     stats.games = stats
@@ -88,7 +110,7 @@ pub fn record_battle(ctx: Context<RecordBattle>, win: bool, opponent_is_bot: boo
         (true, true) => RATING_WIN_VS_BOT,
         (false, true) => RATING_LOSS_VS_BOT,
     };
-    stats.rating = stats.rating.saturating_add(delta).max(RATING_FLOOR);
+    stats.rating = apply_rating_delta(stats.rating, delta);
 
     // Min-heap upsert: in-heap -> update + re-heapify; room -> push + sift up;
     // full -> evict the root iff the new rating beats the weakest of the top.
@@ -123,4 +145,15 @@ pub fn set_profile(ctx: Context<SetProfile>, name: String, uri: String) -> Resul
     stats.profile_uri = [0u8; PlayerStats::MAX_URI_LEN];
     stats.profile_uri[..uri.len()].copy_from_slice(uri.as_bytes());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rating_delta_never_crosses_the_floor() {
+        assert_eq!(apply_rating_delta(5, RATING_LOSS_VS_PLAYER), RATING_FLOOR);
+        assert_eq!(apply_rating_delta(0, RATING_LOSS_VS_BOT), RATING_FLOOR);
+    }
 }

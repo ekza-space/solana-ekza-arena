@@ -23,8 +23,20 @@ Program ID (localnet/dev): `D3a99Wj3eLLn4jbXU5rLDbaFT6giQiUbmcPkiyQSM8iZ`
   - `mint_arena_item` (1 tx): seed from the recent SlotHash; grindable in
     theory, so hard-capped at Legendary.
   - `commit_mint` → `reveal_mint` (2 tx): commit locks a *future* slot and
-    charges a non-refundable fee; reveal rolls from that slot's then-unknown
-    hash. Grind-resistant — the only path that can roll **Mythic (1/1000)**.
+    charges and immediately distributes a non-refundable fee; reveal rolls from
+    that slot's then-unknown hash. Grind-resistant — the only path that can roll
+    **Mythic (1/1000)**.
+- **Creator economics** — recommended fee is 0.02 SOL, governed as basis points
+  (default 50% creator / 40% platform / 10% sink). Stellar-backed commits send
+  the creator slice through `solana_stellar::deposit_revenue` to that release's
+  `ReleaseVault`; Builtin/IPFS commits fold the creator slice into platform.
+  Distribution happens atomically during commit, so abandoning or missing the
+  reveal window cannot strand the paid fee. The Stellar release/vault/asset are
+  bound into the commit and cannot be swapped at reveal.
+- **Secondary royalty metadata** — item NFTs advertise 5% Metaplex royalties.
+  Stellar items name the release authority as creator/distributor; other items
+  name the platform treasury. This is legacy marketplace-honored metadata, not
+  transfer-hook enforcement.
 - **Scrap** (`scrap_arena_item`) — the economic sink: burns the NFT and closes
   the `ArenaItem` PDA, rent back to the holder.
 
@@ -32,7 +44,7 @@ Program ID (localnet/dev): `D3a99Wj3eLLn4jbXU5rLDbaFT6giQiUbmcPkiyQSM8iZ`
 
 | Instruction | Purpose |
 |---|---|
-| `configure_registry` | Set treasury + commit fee (lamports). |
+| `configure_registry` | Set authority-guarded fee, creator/platform/sink bps, treasury and sink. |
 | `register_arena_asset` | Create a direct Arena card. |
 | `register_arena_asset_from_stellar` | Bridge a finalized Stellar release as a skin-only card. |
 | `mint_arena_item` | 1-tx mint of a rolled item NFT (≤ Legendary). |
@@ -66,3 +78,8 @@ yarn lint
 
 `Anchor.toml` genesis-clones the sibling `../solana-stellar` program and the
 Metaplex Token Metadata program for localnet tests.
+
+The registry account layout now includes configuration authority and fee-split
+fields. Existing deployments created with the older, smaller layout require a
+one-time migration/reinitialization before upgrading this program; the current
+project configuration is localnet-only.

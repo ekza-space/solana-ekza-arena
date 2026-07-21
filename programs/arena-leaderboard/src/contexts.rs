@@ -1,8 +1,8 @@
 use anchor_lang::prelude::*;
 
 use crate::{
-    constants::PLAYER_STATS_SEED,
-    state::{Leaderboard, PlayerStats},
+    constants::{BATTLE_RATE_LIMIT_SEED, PLAYER_STATS_SEED},
+    state::{BattleRateLimit, Leaderboard, PlayerStats},
 };
 
 #[derive(Accounts)]
@@ -33,6 +33,17 @@ pub struct RegisterSessionKey<'info> {
         bump
     )]
     pub player_stats: Account<'info, PlayerStats>,
+
+    /// Pre-created by the wallet so the normal session-key flow never makes
+    /// an unfunded burner pay the one-time throttle-account rent.
+    #[account(
+        init_if_needed,
+        payer = player,
+        space = 8 + BattleRateLimit::INIT_SPACE,
+        seeds = [BATTLE_RATE_LIMIT_SEED, player.key().as_ref()],
+        bump
+    )]
+    pub battle_rate_limit: Account<'info, BattleRateLimit>,
 
     /// Only the real wallet may grant (or rotate) its session key.
     #[account(mut)]
@@ -76,6 +87,18 @@ pub struct RecordBattle<'info> {
         bump
     )]
     pub player_stats: Account<'info, PlayerStats>,
+
+    /// Separate PDA preserves the binary layout of already-created local
+    /// PlayerStats accounts. Normally wallet-funded during session-key
+    /// registration; lazily signer-funded for an owner's first direct battle.
+    #[account(
+        init_if_needed,
+        payer = signer,
+        space = 8 + BattleRateLimit::INIT_SPACE,
+        seeds = [BATTLE_RATE_LIMIT_SEED, player.key().as_ref()],
+        bump
+    )]
+    pub battle_rate_limit: Account<'info, BattleRateLimit>,
 
     /// CHECK: the wallet the battle is recorded FOR. Not required to sign —
     /// authorization is `signer == player || signer == stats.session_key`,

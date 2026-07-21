@@ -42,6 +42,12 @@ pub enum ArenaRegistryError {
     RegistryNotConfigured,
     #[msg("The supplied treasury account does not match the configured treasury.")]
     InvalidTreasury,
+    #[msg("The supplied sink account does not match the configured protocol sink.")]
+    InvalidSink,
+    #[msg("Fee split basis points must sum to exactly 10,000.")]
+    InvalidFeeSplit,
+    #[msg("The Stellar release supplied at reveal does not match the paid commit.")]
+    StellarCommitMismatch,
     #[msg("The referenced arena asset is not an Avatar card.")]
     InvalidAvatarAsset,
     #[msg("Invalid avatar name (empty or too long).")]

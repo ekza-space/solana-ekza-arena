@@ -17,6 +17,7 @@ pub struct StellarReleaseOrigin {
     pub universe: Pubkey,
     pub asset: Pubkey,
     pub vault: Pubkey,
+    pub authority: Pubkey,
     pub status: ReleaseStatus,
 }
 
@@ -67,8 +68,35 @@ pub fn validate_stellar_release<'info>(
         universe: release_account.universe,
         asset: release_account.asset,
         vault: release_account.vault,
+        authority: release_account.authority,
         status: release_account.status,
     })
+}
+
+/// CPI `deposit_revenue`: atomically transfers SOL from the transaction signer
+/// into the Stellar release vault and advances Stellar's accounted
+/// `total_deposited_lamports`. Paying during commit (while the wallet is still
+/// the signer) means an abandoned reveal can never strand creator funds.
+pub fn deposit_revenue_to_stellar<'info>(
+    amount: u64,
+    payer: &AccountInfo<'info>,
+    stellar_program: &AccountInfo<'info>,
+    release: &AccountInfo<'info>,
+    vault: &AccountInfo<'info>,
+    system_program: &AccountInfo<'info>,
+) -> Result<()> {
+    solana_stellar::cpi::deposit_revenue(
+        CpiContext::new(
+            stellar_program.clone(),
+            solana_stellar::cpi::accounts::DepositRevenue {
+                release: release.clone(),
+                vault: vault.clone(),
+                payer: payer.clone(),
+                system_program: system_program.clone(),
+            },
+        ),
+        amount,
+    )
 }
 
 /// Validate that `universe` is the release's universe, is a real solana-stellar

@@ -33,10 +33,7 @@ pub mod solana_ekza_arena {
         handlers::register_arena_asset_from_stellar(ctx, args)
     }
 
-    pub fn mint_arena_item(
-        ctx: Context<MintArenaItem>,
-        args: MintArenaItemArgs,
-    ) -> Result<()> {
+    pub fn mint_arena_item(ctx: Context<MintArenaItem>, args: MintArenaItemArgs) -> Result<()> {
         handlers::mint_arena_item(ctx, args)
     }
 
@@ -44,7 +41,7 @@ pub mod solana_ekza_arena {
         handlers::scrap_arena_item(ctx)
     }
 
-    /// Set the treasury + commit fee for the commit-reveal mint (spec §12.1).
+    /// Set authority-guarded fee destinations and creator/platform/sink split.
     pub fn configure_registry(
         ctx: Context<ConfigureRegistry>,
         args: ConfigureRegistryArgs,
@@ -52,7 +49,7 @@ pub mod solana_ekza_arena {
         handlers::configure_registry(ctx, args)
     }
 
-    /// Commit-reveal mint — step 1: lock a future slot + charge the fee (§12.1).
+    /// Commit-reveal mint — step 1: lock a future slot + distribute the fee.
     pub fn commit_mint(ctx: Context<CommitMint>, args: CommitMintArgs) -> Result<()> {
         handlers::commit_mint(ctx, args)
     }

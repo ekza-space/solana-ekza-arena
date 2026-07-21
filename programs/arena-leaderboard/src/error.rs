@@ -2,7 +2,9 @@ use anchor_lang::prelude::*;
 
 #[error_code]
 pub enum LeaderboardError {
-    #[msg("Leaderboard capacity out of range (min 2, max 1000; production boards use 100..=1000).")]
+    #[msg(
+        "Leaderboard capacity out of range (min 2, max 1000; production boards use 100..=1000)."
+    )]
     CapacityOutOfRange,
     #[msg("The leaderboard is already initialized.")]
     AlreadyInitialized,
@@ -18,4 +20,8 @@ pub enum LeaderboardError {
     NumericalOverflow,
     #[msg("Unauthorized action.")]
     Unauthorized,
+    #[msg("Battle recording is on cooldown for this player; wait for the next slot.")]
+    BattleCooldownActive,
+    #[msg("This player has reached the maximum number of battle records for the current UTC day.")]
+    DailyBattleLimitReached,
 }

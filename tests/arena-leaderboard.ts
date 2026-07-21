@@ -16,7 +16,8 @@ describe("arena-leaderboard", () => {
   anchor.setProvider(anchor.AnchorProvider.env());
 
   const provider = anchor.getProvider() as anchor.AnchorProvider;
-  const program = anchor.workspace.arenaLeaderboard as Program<ArenaLeaderboard>;
+  const program = anchor.workspace
+    .arenaLeaderboard as Program<ArenaLeaderboard>;
 
   // The board is a large zero-copy account (~40 KB) — too big for a single-CPI
   // `init`, so the client creates it with a top-level SystemProgram.createAccount
@@ -59,13 +60,32 @@ describe("arena-leaderboard", () => {
       program.programId
     )[0];
 
+  const battleRateLimitPda = (player: anchor.web3.PublicKey) =>
+    anchor.web3.PublicKey.findProgramAddressSync(
+      [Buffer.from("battle_rate_limit_v1"), player.toBuffer()],
+      program.programId
+    )[0];
+
+  const waitForNextSlot = async () => {
+    const start = await provider.connection.getSlot("processed");
+    const deadline = Date.now() + 10_000;
+    while ((await provider.connection.getSlot("processed")) <= start) {
+      if (Date.now() >= deadline)
+        throw new Error("validator slot did not advance");
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  };
+
   const airdrop = async (to: anchor.web3.PublicKey, sol = 10) => {
     const sig = await provider.connection.requestAirdrop(
       to,
       sol * anchor.web3.LAMPORTS_PER_SOL
     );
     const blockhash = await provider.connection.getLatestBlockhash();
-    await provider.connection.confirmTransaction({ signature: sig, ...blockhash });
+    await provider.connection.confirmTransaction({
+      signature: sig,
+      ...blockhash,
+    });
   };
 
   type Board = Awaited<ReturnType<typeof program.account.leaderboard.fetch>>;
@@ -110,7 +130,7 @@ describe("arena-leaderboard", () => {
   const board4 = board4Kp.publicKey;
   const CAPACITY = 4;
 
-  // Ladder cast: p1..p4 fill the board, p5 evicts, p6 grinds the floor.
+  // Ladder cast: p1..p4 fill the board, p5 evicts, p6 exercises the daily cap.
   const p1 = anchor.web3.Keypair.generate();
   const p2 = anchor.web3.Keypair.generate();
   const p3 = anchor.web3.Keypair.generate();
@@ -119,32 +139,48 @@ describe("arena-leaderboard", () => {
   const p6 = anchor.web3.Keypair.generate();
   const sessionKey = anchor.web3.Keypair.generate();
   const strangerKey = anchor.web3.Keypair.generate();
+  const throttlePlayer = anchor.web3.Keypair.generate();
 
   before(async () => {
     await Promise.all(
-      [p1, p2, p3, p4, p5, p6, boardAuthority, sessionKey, strangerKey].map(
-        (kp) => airdrop(kp.publicKey)
-      )
+      [
+        p1,
+        p2,
+        p3,
+        p4,
+        p5,
+        p6,
+        boardAuthority,
+        sessionKey,
+        strangerKey,
+        throttlePlayer,
+      ].map((kp) => airdrop(kp.publicKey))
     );
   });
 
-  const recordBattle = (
+  const recordBattle = async (
     player: anchor.web3.Keypair,
     win: boolean,
     opponentIsBot: boolean,
     board: anchor.web3.PublicKey = board4,
     signer: anchor.web3.Keypair = player
-  ) =>
-    program.methods
+  ) => {
+    // Confirmed transactions can still be submitted within the same validator
+    // slot. Normal test writes wait one slot; the dedicated cooldown test below
+    // deliberately batches two raw instructions without this helper.
+    await waitForNextSlot();
+    return program.methods
       .recordBattle(win, opponentIsBot)
       .accountsPartial({
         leaderboard: board,
         playerStats: playerStatsPda(player.publicKey),
+        battleRateLimit: battleRateLimitPda(player.publicKey),
         player: player.publicKey,
         signer: signer.publicKey,
       })
       .signers([signer])
       .rpc();
+  };
 
   it("initializes a leaderboard (small board, capacity 4)", async () => {
     await createAndInitBoard(boardAuthority, board4Kp, CAPACITY);
@@ -250,7 +286,9 @@ describe("arena-leaderboard", () => {
       [p1, p2, p3, p4].map((k) => k.publicKey.toBase58())
     );
     // Min-heap: the ROOT is the weakest of the top (p3 @ 980).
-    expect(board.entries[0].player.toBase58()).to.equal(p3.publicKey.toBase58());
+    expect(board.entries[0].player.toBase58()).to.equal(
+      p3.publicKey.toBase58()
+    );
     expect(board.entries[0].rating).to.equal(980);
   });
 
@@ -270,7 +308,9 @@ describe("arena-leaderboard", () => {
       topPlayers(board).filter((p) => p === p5.publicKey.toBase58()).length
     ).to.equal(1);
     // New weakest of the top is p4 @ 1010.
-    expect(board.entries[0].player.toBase58()).to.equal(p4.publicKey.toBase58());
+    expect(board.entries[0].player.toBase58()).to.equal(
+      p4.publicKey.toBase58()
+    );
     expect(board.entries[0].rating).to.equal(1010);
 
     // p3 keeps its PlayerStats even after eviction — only the slot is lost.
@@ -293,6 +333,7 @@ describe("arena-leaderboard", () => {
       .registerSessionKey(sessionKey.publicKey)
       .accountsPartial({
         playerStats: playerStatsPda(p1.publicKey),
+        battleRateLimit: battleRateLimitPda(p1.publicKey),
         player: p1.publicKey,
       })
       .signers([p1])
@@ -317,6 +358,72 @@ describe("arena-leaderboard", () => {
       recordBattle(p1, true, true, board4, strangerKey),
       "SessionKeyMismatch"
     );
+  });
+
+  it("rate-limits owner and session-key writes through one player PDA", async () => {
+    const throttleSession = anchor.web3.Keypair.generate();
+
+    // Wallet registration creates both PDAs, so the burner does not pay rent.
+    await program.methods
+      .registerSessionKey(throttleSession.publicKey)
+      .accountsPartial({
+        playerStats: playerStatsPda(throttlePlayer.publicKey),
+        battleRateLimit: battleRateLimitPda(throttlePlayer.publicKey),
+        player: throttlePlayer.publicKey,
+      })
+      .signers([throttlePlayer])
+      .rpc();
+
+    await recordBattle(throttlePlayer, true, true);
+    let limiter = await program.account.battleRateLimit.fetch(
+      battleRateLimitPda(throttlePlayer.publicKey)
+    );
+    expect(limiter.battlesToday).to.equal(1);
+
+    await waitForNextSlot();
+    const sessionIx = await program.methods
+      .recordBattle(true, true)
+      .accountsPartial({
+        leaderboard: board4,
+        playerStats: playerStatsPda(throttlePlayer.publicKey),
+        battleRateLimit: battleRateLimitPda(throttlePlayer.publicKey),
+        player: throttlePlayer.publicKey,
+        signer: throttleSession.publicKey,
+      })
+      .instruction();
+    const ownerIx = await program.methods
+      .recordBattle(true, true)
+      .accountsPartial({
+        leaderboard: board4,
+        playerStats: playerStatsPda(throttlePlayer.publicKey),
+        battleRateLimit: battleRateLimitPda(throttlePlayer.publicKey),
+        player: throttlePlayer.publicKey,
+        signer: throttlePlayer.publicKey,
+      })
+      .instruction();
+
+    // Both instructions execute in one slot. The session write consumes the
+    // allowance first and the owner write sees the same player limiter.
+    await expectErrorCode(
+      provider.sendAndConfirm(
+        new anchor.web3.Transaction().add(sessionIx, ownerIx),
+        [throttleSession, throttlePlayer]
+      ),
+      "BattleCooldownActive"
+    );
+
+    // Failed transactions are atomic: the first instruction is rolled back.
+    limiter = await program.account.battleRateLimit.fetch(
+      battleRateLimitPda(throttlePlayer.publicKey)
+    );
+    expect(limiter.battlesToday).to.equal(1);
+
+    // Recovery needs no authority bypass: normal slot progression is enough.
+    await recordBattle(throttlePlayer, true, true, board4, throttleSession);
+    limiter = await program.account.battleRateLimit.fetch(
+      battleRateLimitPda(throttlePlayer.publicKey)
+    );
+    expect(limiter.battlesToday).to.equal(2);
   });
 
   it("revokes the session key (wallet-only) and then rejects it", async () => {
@@ -390,44 +497,35 @@ describe("arena-leaderboard", () => {
     );
   });
 
-  it("rating never drops below the floor (0)", async () => {
-    // p6 sits at 980 after its earlier loss; 49 more player-losses (-20) reach
-    // exactly 0, then one more must stay at 0. Batched 10 ixs/tx to keep the
-    // localnet round-trips down (identical instructions in one tx are legal).
-    const lossIx = () =>
-      program.methods
-        .recordBattle(false, false)
-        .accountsPartial({
-          leaderboard: board4,
-          playerStats: playerStatsPda(p6.publicKey),
-          player: p6.publicKey,
-          signer: p6.publicKey,
-        })
-        .instruction();
-
-    let remaining = 49;
-    while (remaining > 0) {
-      const batch = Math.min(10, remaining);
-      const tx = new anchor.web3.Transaction().add(
-        anchor.web3.ComputeBudgetProgram.setComputeUnitLimit({
-          units: 1_000_000,
-        })
-      );
-      for (let i = 0; i < batch; i++) tx.add(await lossIx());
-      await provider.sendAndConfirm(tx, [p6]);
-      remaining -= batch;
+  it("enforces the per-UTC-day cap without mutating stats on rejection", async () => {
+    // p6 already recorded one loss above. Fill the remaining 19 allowances.
+    for (let i = 1; i < 20; i++) {
+      await recordBattle(p6, false, false);
     }
 
     let stats = await program.account.playerStats.fetch(
       playerStatsPda(p6.publicKey)
     );
-    expect(stats.rating).to.equal(0);
-    expect(stats.losses).to.equal(50);
+    expect(stats.games).to.equal(20);
+    expect(stats.losses).to.equal(20);
+    expect(stats.rating).to.equal(600);
 
-    await recordBattle(p6, false, false);
-    stats = await program.account.playerStats.fetch(playerStatsPda(p6.publicKey));
-    expect(stats.rating).to.equal(0); // floored, not negative
-    expect(stats.games).to.equal(51);
+    const limiterBefore = await program.account.battleRateLimit.fetch(
+      battleRateLimitPda(p6.publicKey)
+    );
+    expect(limiterBefore.battlesToday).to.equal(20);
+
+    await expectErrorCode(
+      recordBattle(p6, false, false),
+      "DailyBattleLimitReached"
+    );
+
+    stats = await program.account.playerStats.fetch(
+      playerStatsPda(p6.publicKey)
+    );
+    expect(stats.games).to.equal(20);
+    expect(stats.losses).to.equal(20);
+    expect(stats.rating).to.equal(600);
     await fetchBoardChecked(board4);
   });
 });

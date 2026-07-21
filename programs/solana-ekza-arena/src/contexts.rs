@@ -427,8 +427,8 @@ pub struct UnequipItemV2<'info> {
     pub system_program: Program<'info, System>,
 }
 
-/// Configure the registry's commit-reveal economics (spec §12.1): the treasury
-/// that receives the non-refundable commit fee, and the fee amount. Uses
+/// Configure the registry's commit-reveal economics: fee, split and
+/// destinations. Uses
 /// `init_if_needed` so the same registry PDA shared by the other instructions is
 /// created/updated; callable to (re)point the treasury or retune the fee.
 #[derive(Accounts)]
@@ -474,10 +474,25 @@ pub struct CommitMint<'info> {
     #[account(mut)]
     pub minter: Signer<'info>,
 
-    /// CHECK: Treasury that receives the commit fee; must equal the configured
-    /// `registry.treasury` (enforced in the handler).
+    /// CHECK: Receives the platform slice; address checked against registry.
     #[account(mut)]
     pub treasury: UncheckedAccount<'info>,
+
+    /// CHECK: Receives the protocol-sink slice; address checked against registry.
+    #[account(mut)]
+    pub sink: UncheckedAccount<'info>,
+
+    // Stellar is required at commit (not reveal-only) for creator-backed
+    // skins. The CPI can therefore use `minter` as its real system signer and
+    // no fee remains trapped if reveal is abandoned.
+    /// CHECK: Validated by executable bit and the fixed solana-stellar id.
+    pub stellar_program: Option<AccountInfo<'info>>,
+    /// CHECK: Typed/owned/status-validated, then mutated by deposit_revenue CPI.
+    #[account(mut)]
+    pub stellar_release: Option<AccountInfo<'info>>,
+    /// CHECK: Validated against the release, then funded by deposit_revenue CPI.
+    #[account(mut)]
+    pub stellar_vault: Option<AccountInfo<'info>>,
 
     pub system_program: Program<'info, System>,
 }
@@ -560,6 +575,7 @@ pub struct RevealMint<'info> {
     pub master_edition: UncheckedAccount<'info>,
 
     // Optional Stellar accounts — required only when the committed `skin == Stellar`.
+    // Their release/vault/asset identity must match what commit_mint persisted.
     /// CHECK: Validated by owner, executable bit, and fixed program id.
     pub stellar_program: Option<AccountInfo<'info>>,
     /// CHECK: Validated as a solana-stellar Release account by fixed-layout fields.

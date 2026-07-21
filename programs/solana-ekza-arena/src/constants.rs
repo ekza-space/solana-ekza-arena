@@ -33,9 +33,28 @@ pub const EQUIPMENT_SEED: &[u8] = b"equipment";
 /// is ~2s on localnet — still a tiny, sane anti-grind delay.
 pub const REVEAL_DELAY_SLOTS: u64 = 5;
 
-/// Default non-refundable commit fee (0.01 SOL, spec §12.1). The on-chain value
-/// actually charged is `ArenaRegistry::commit_fee_lamports` set at configure.
-pub const COMMIT_FEE_LAMPORTS: u64 = 10_000_000;
+/// Recommended/default non-refundable commit fee (0.02 SOL). The actual value
+/// charged is governed by `ArenaRegistry::commit_fee_lamports`.
+#[constant]
+pub const COMMIT_FEE_LAMPORTS: u64 = 20_000_000;
+
+/// Fee and royalty basis-point denominator.
+#[constant]
+pub const BPS_DENOMINATOR: u16 = 10_000;
+
+/// Launch defaults: 50% creator / 40% platform / 10% protocol sink.
+#[constant]
+pub const DEFAULT_CREATOR_BPS: u16 = 5_000;
+#[constant]
+pub const DEFAULT_PLATFORM_BPS: u16 = 4_000;
+#[constant]
+pub const DEFAULT_SINK_BPS: u16 = 1_000;
+
+/// Metaplex legacy royalty advertised by every Arena item NFT. This is the
+/// immediately-compatible royalty signal; marketplaces may still choose not
+/// to honor legacy royalties.
+#[constant]
+pub const ITEM_ROYALTY_BPS: u16 = 500;
 
 #[constant]
 pub const STELLAR_LINK_SEED: &[u8] = b"stellar_arena_link";

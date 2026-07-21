@@ -1,0 +1,29 @@
+[package]
+name = "arena-leaderboard"
+version = "0.1.0"
+description = "Ekza Arena on-chain leaderboard: binary-heap top-N with auto-eviction, per-player battle stats, profile links for top players"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "arena_leaderboard"
+
+[features]
+default = []
+cpi = ["no-entrypoint"]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+idl-build = ["anchor-lang/idl-build"]
+anchor-debug = []
+custom-heap = []
+custom-panic = []
+
+[dependencies]
+anchor-lang = { version = "0.32.1", features = ["init-if-needed"] }
+# zero_copy: the derive expands to `bytemuck::…` paths, and the 1000-entry
+# heap array needs the const-generic Pod impl (`min_const_generics`).
+bytemuck = { version = "1", features = ["derive", "min_const_generics"] }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("solana"))'] }

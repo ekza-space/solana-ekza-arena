@@ -582,7 +582,10 @@ mod tests {
         let (seed, item) = found.expect("no Mythic found in 200k seeds — weights broken");
         println!("Mythic seed={seed:#x} affixes={}", item.affixes.len());
         assert_eq!(item.tier, 5, "Mythic must be tier 5");
-        assert_eq!(item.affixes[0].kind, KIND_FLAT_ATK, "weapon primary = FlatAtk");
+        assert_eq!(
+            item.affixes[0].kind, KIND_FLAT_ATK,
+            "weapon primary = FlatAtk"
+        );
         // Mythic primary uses tier 5 ⇒ ×5 range (outsized).
         let r = primary_range(KIND_FLAT_ATK);
         let v = item.affixes[0].value as i64;
@@ -606,7 +609,10 @@ mod tests {
                 "capped roll produced rarity {} (seed {seed})",
                 capped.rarity
             );
-            assert!(capped.tier <= 4, "capped tier exceeded Legendary (seed {seed})");
+            assert!(
+                capped.tier <= 4,
+                "capped tier exceeded Legendary (seed {seed})"
+            );
             if roll_item(seed, BASE_WEAPON).rarity == RARITY_MYTHIC {
                 assert_eq!(
                     capped.rarity, RARITY_LEGENDARY,
@@ -674,7 +680,10 @@ mod tests {
 
         // Stable invariants on the golden vector.
         assert_eq!(item.base_type, BASE_WEAPON);
-        assert_eq!(item.affixes[0].kind, KIND_FLAT_ATK, "weapon primary = FlatAtk");
+        assert_eq!(
+            item.affixes[0].kind, KIND_FLAT_ATK,
+            "weapon primary = FlatAtk"
+        );
         assert_eq!(item.tier, TIER_BY_RARITY[item.rarity as usize]);
         let want_secondary = SECONDARY_COUNT_BY_RARITY[item.rarity as usize] as usize;
         assert!(item.affixes.len() <= 1 + want_secondary);

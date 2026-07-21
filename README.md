@@ -20,12 +20,16 @@ Program ID (localnet/dev): `D3a99Wj3eLLn4jbXU5rLDbaFT6giQiUbmcPkiyQSM8iZ`
   chosen Avatar card, display name, cosmetic skin, and four equip slots
   (Weapon/Head/Armor/Charm) holding equipped item NFT mints.
 - **Fair randomness** — two mint paths:
-  - `mint_arena_item` (1 tx): seed from the recent SlotHash; grindable in
-    theory, so hard-capped at Legendary.
+  - `mint_arena_item` (1 tx): a registry-authority-only development/admin
+    path, seeded from the recent SlotHash and hard-capped at Legendary. Public
+    wallets cannot use it to bypass commit-mint economics.
   - `commit_mint` → `reveal_mint` (2 tx): commit locks a *future* slot and
     charges and immediately distributes a non-refundable fee; reveal rolls from
     that slot's then-unknown hash. Grind-resistant — the only path that can roll
     **Mythic (1/1000)**.
+  - A commit expires 128 slots after its target. Anyone may clean it up after
+    expiry, but all PDA rent returns to the original minter; the fee was already
+    distributed and is never refundable or held in the commit.
 - **Creator economics** — recommended fee is 0.02 SOL, governed as basis points
   (default 50% creator / 40% platform / 10% sink). Stellar-backed commits send
   the creator slice through `solana_stellar::deposit_revenue` to that release's
@@ -45,10 +49,13 @@ Program ID (localnet/dev): `D3a99Wj3eLLn4jbXU5rLDbaFT6giQiUbmcPkiyQSM8iZ`
 | Instruction | Purpose |
 |---|---|
 | `configure_registry` | Set authority-guarded fee, creator/platform/sink bps, treasury and sink. |
+| `rotate_registry_authority` | Transfer registry governance (current-authority signed). |
+| `migrate_registry_v1` | Upgrade-authority/genesis-authority migration of the legacy registry PDA. |
 | `register_arena_asset` | Create a direct Arena card. |
 | `register_arena_asset_from_stellar` | Bridge a finalized Stellar release as a skin-only card. |
 | `mint_arena_item` | 1-tx mint of a rolled item NFT (≤ Legendary). |
 | `commit_mint` / `reveal_mint` | Commit-reveal mint (full ladder incl. Mythic). |
+| `close_expired_commit` | Permissionlessly close an expired commit; rent returns to its minter. |
 | `scrap_arena_item` | Burn item NFT + close its PDA (holder only). |
 | `create_player_avatar` | Create the wallet's character from an Avatar card. |
 | `customize_avatar` | Rename, change cosmetic skin, or swap the base card (swap clears equips). |
@@ -80,6 +87,11 @@ yarn lint
 Metaplex Token Metadata program for localnet tests.
 
 The registry account layout now includes configuration authority and fee-split
-fields. Existing deployments created with the older, smaller layout require a
-one-time migration/reinitialization before upgrading this program; the current
-project configuration is localnet-only.
+fields. Existing deployments created with the older 57-byte account use
+`migrate_registry_v1`, which validates the exact legacy discriminator/layout,
+preserves `next_index`, tops up rent, reallocates to 127 bytes and writes the
+current configuration. Bootstrap/migration requires either the deployed
+ProgramData upgrade authority or the compile-time `GENESIS_REGISTRY_AUTHORITY`.
+That genesis key is a project trust root and **must be reviewed/replaced before
+every production deployment**. After bootstrap it has no override: only the
+authority stored in the registry may configure or rotate governance.

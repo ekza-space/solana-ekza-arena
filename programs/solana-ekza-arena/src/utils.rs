@@ -155,6 +155,8 @@ pub fn link_arena_asset_to_stellar<'info>(
 /// CPI `record_release_deployment`: write the per-project bridge record on the
 /// Stellar side (seeds `[b"release_deployment", release, project_slug]`).
 /// Signer must be the release authority.
+// Anchor CPI account plumbing is intentionally explicit at this boundary.
+#[allow(clippy::too_many_arguments)]
 pub fn record_release_deployment_to_stellar<'info>(
     project_slug: &str,
     registry_program: Pubkey,

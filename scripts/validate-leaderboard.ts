@@ -87,7 +87,9 @@ async function main() {
   console.log("PAYER:  " + wallet.publicKey.toBase58());
 
   // Sanity: the program must be deployed on this localnet.
-  const progInfo = await connection.getAccountInfo(ARENA_LEADERBOARD_PROGRAM_ID);
+  const progInfo = await connection.getAccountInfo(
+    ARENA_LEADERBOARD_PROGRAM_ID
+  );
   if (!progInfo || !progInfo.executable) {
     console.error(
       `FATAL: arena_leaderboard (${ARENA_LEADERBOARD_PROGRAM_ID.toBase58()}) is ` +
@@ -115,7 +117,10 @@ async function main() {
   };
 
   // Fund the payer if the validator handed it nothing.
-  if ((await connection.getBalance(wallet.publicKey)) < anchor.web3.LAMPORTS_PER_SOL) {
+  if (
+    (await connection.getBalance(wallet.publicKey)) <
+    anchor.web3.LAMPORTS_PER_SOL
+  ) {
     await airdrop(wallet.publicKey, 100).catch(() => {});
   }
 
@@ -127,6 +132,21 @@ async function main() {
   ) => {
     const tx = new anchor.web3.Transaction().add(ix);
     return provider.sendAndConfirm(tx, signers);
+  };
+
+  // The program deliberately accepts at most one battle per player per slot.
+  // Standalone localnets can confirm consecutive transactions in the same
+  // slot, so wait for real chain progress before recording another battle for
+  // the same player. This keeps the validator faithful to production rules
+  // instead of bypassing the limiter in test code.
+  const waitForNextSlot = async () => {
+    const currentSlot = await connection.getSlot("confirmed");
+    const deadline = Date.now() + 10_000;
+    while (Date.now() < deadline) {
+      if ((await connection.getSlot("confirmed")) > currentSlot) return;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    throw new Error(`validator did not advance past slot ${currentSlot}`);
   };
 
   type Board = Awaited<ReturnType<typeof program.account.leaderboard.fetch>>;
@@ -177,8 +197,15 @@ async function main() {
     .rpc();
 
   let board = await fetchBoard();
-  check("board authority == payer", board.authority.toBase58() === wallet.publicKey.toBase58());
-  check("board capacity == 3", board.capacity === CAPACITY, String(board.capacity));
+  check(
+    "board authority == payer",
+    board.authority.toBase58() === wallet.publicKey.toBase58()
+  );
+  check(
+    "board capacity == 3",
+    board.capacity === CAPACITY,
+    String(board.capacity)
+  );
   check("board starts empty", board.size === 0, String(board.size));
   console.log("    board = " + boardKp.publicKey.toBase58());
 
@@ -236,6 +263,7 @@ async function main() {
     });
     await sendIx(ix, [sessionKey]);
     await fetchBoard(); // invariant after every op
+    if (i < 2) await waitForNextSlot();
   }
 
   const selfBattle = async (
@@ -263,9 +291,7 @@ async function main() {
   check(
     "top list == {hero, p2, p3}",
     JSON.stringify(topPlayers(board).sort()) ===
-      JSON.stringify(
-        [hero, p2, p3].map((k) => k.publicKey.toBase58()).sort()
-      )
+      JSON.stringify([hero, p2, p3].map((k) => k.publicKey.toBase58()).sort())
   );
   check(
     "root is the weakest of the top (p3 @ 1010)",
@@ -279,7 +305,11 @@ async function main() {
     .slice(0, board.size)
     .find((e: any) => e.player.equals(hero.publicKey));
   check("hero in top list", !!heroEntry);
-  check("hero rating == 1030", heroEntry?.rating === 1030, String(heroEntry?.rating));
+  check(
+    "hero rating == 1030",
+    heroEntry?.rating === 1030,
+    String(heroEntry?.rating)
+  );
   check("hero wins == 3", heroEntry?.wins === 3, String(heroEntry?.wins));
 
   // =========================================================================
@@ -288,11 +318,15 @@ async function main() {
   // =========================================================================
   console.log("\n[4] Stronger challenger evicts the weakest of the top…");
   await selfBattle(p4, true, false); // 1025 (< root? root 1010 → 1025 evicts p3)
+  await waitForNextSlot();
   await selfBattle(p4, true, false); // 1050 (updates p4 in place)
   board = await fetchBoard();
   check("board still size 3", board.size === 3, String(board.size));
   check("p3 evicted", !topPlayers(board).includes(p3.publicKey.toBase58()));
-  check("p4 now in top list", topPlayers(board).includes(p4.publicKey.toBase58()));
+  check(
+    "p4 now in top list",
+    topPlayers(board).includes(p4.publicKey.toBase58())
+  );
   check(
     "no duplicate p4 entry (in-place update)",
     topPlayers(board).filter((p) => p === p4.publicKey.toBase58()).length === 1
@@ -301,7 +335,11 @@ async function main() {
   const p3Stats = await program.account.playerStats.fetch(
     playerStatsPda(programId, p3.publicKey)
   );
-  check("evicted p3 keeps rating 1010", p3Stats.rating === 1010, String(p3Stats.rating));
+  check(
+    "evicted p3 keeps rating 1010",
+    p3Stats.rating === 1010,
+    String(p3Stats.rating)
+  );
 
   // =========================================================================
   // STEP 5 — set_profile (top-list perk) for the hero, then read it back.
@@ -320,8 +358,16 @@ async function main() {
   const fixedUtf8 = (bytes: number[]) =>
     Buffer.from(bytes).toString("utf8").replace(/\0+$/, "");
   const heroStats = await program.account.playerStats.fetch(heroStatsPda);
-  check("profile_name reads back", fixedUtf8(heroStats.profileName as number[]) === NAME, fixedUtf8(heroStats.profileName as number[]));
-  check("profile_uri reads back", fixedUtf8(heroStats.profileUri as number[]) === URI, fixedUtf8(heroStats.profileUri as number[]));
+  check(
+    "profile_name reads back",
+    fixedUtf8(heroStats.profileName as number[]) === NAME,
+    fixedUtf8(heroStats.profileName as number[])
+  );
+  check(
+    "profile_uri reads back",
+    fixedUtf8(heroStats.profileUri as number[]) === URI,
+    fixedUtf8(heroStats.profileUri as number[])
+  );
 
   // =========================================================================
   // VERDICT
@@ -341,10 +387,14 @@ async function main() {
   );
 
   if (failures === 0) {
-    console.log("\n==================== BATTLE→LEADERBOARD: PASS ====================");
+    console.log(
+      "\n==================== BATTLE→LEADERBOARD: PASS ===================="
+    );
     process.exit(0);
   } else {
-    console.log(`\n============== BATTLE→LEADERBOARD: FAIL (${failures}) ==============`);
+    console.log(
+      `\n============== BATTLE→LEADERBOARD: FAIL (${failures}) ==============`
+    );
     process.exit(1);
   }
 }

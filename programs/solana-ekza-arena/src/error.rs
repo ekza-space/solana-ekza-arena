@@ -38,8 +38,14 @@ pub enum ArenaRegistryError {
     RevealTooEarly,
     #[msg("The committed target slot's hash is no longer in the SlotHashes sysvar.")]
     SlotHashNotFound,
+    #[msg("The committed reveal window has expired.")]
+    RevealWindowExpired,
+    #[msg("The mint commitment has not expired yet.")]
+    CommitNotExpired,
     #[msg("The registry has not been configured with a treasury / commit fee.")]
     RegistryNotConfigured,
+    #[msg("Only the configured registry authority may use the privileged development mint.")]
+    QuickMintRestricted,
     #[msg("The supplied treasury account does not match the configured treasury.")]
     InvalidTreasury,
     #[msg("The supplied sink account does not match the configured protocol sink.")]
@@ -48,6 +54,14 @@ pub enum ArenaRegistryError {
     InvalidFeeSplit,
     #[msg("The Stellar release supplied at reveal does not match the paid commit.")]
     StellarCommitMismatch,
+    #[msg("The registry can only be bootstrapped by a trusted or program upgrade authority.")]
+    UnauthorizedRegistryBootstrap,
+    #[msg("The supplied program/program-data accounts are invalid.")]
+    InvalidProgramData,
+    #[msg("The new registry authority cannot be the default public key.")]
+    InvalidConfigurationAuthority,
+    #[msg("The registry account does not have the supported legacy v1 layout.")]
+    InvalidRegistryMigration,
     #[msg("The referenced arena asset is not an Avatar card.")]
     InvalidAvatarAsset,
     #[msg("Invalid avatar name (empty or too long).")]

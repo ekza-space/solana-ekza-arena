@@ -239,8 +239,8 @@ impl MintArenaItemArgs {
 #[account]
 pub struct ArenaRegistry {
     pub next_index: u64,
-    /// First successful configure claims authority; all later reconfiguration
-    /// must be signed by the same wallet.
+    /// Bootstrap is restricted to the program upgrade/genesis authority; all
+    /// later configuration and rotation require the authority stored here.
     pub configuration_authority: Pubkey,
     /// Destination of the platform slice of the non-refundable commit fee.
     pub treasury: Pubkey,

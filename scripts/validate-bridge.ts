@@ -165,7 +165,11 @@ async function main() {
     )[0];
   const releaseDeploymentPda = (release: anchor.web3.PublicKey) =>
     anchor.web3.PublicKey.findProgramAddressSync(
-      [Buffer.from("release_deployment"), release.toBuffer(), Buffer.from("arena")],
+      [
+        Buffer.from("release_deployment"),
+        release.toBuffer(),
+        Buffer.from("arena"),
+      ],
       STELLAR_PROGRAM_ID
     )[0];
 
@@ -201,7 +205,12 @@ async function main() {
   const vault = vaultPda(release);
 
   await stellar.methods
-    .createUniverse(new anchor.BN(ownerIndex), `Qm${label}UniverseHash`, { model3D: {} }, true)
+    .createUniverse(
+      new anchor.BN(ownerIndex),
+      `Qm${label}UniverseHash`,
+      { model3D: {} },
+      true
+    )
     .accountsStrict({
       registry: stellarRegistryPda,
       universe,
@@ -222,15 +231,33 @@ async function main() {
       true,
       { custom: {} }
     )
-    .accountsStrict({ universe, asset, creator: owner, systemProgram: anchor.web3.SystemProgram.programId })
+    .accountsStrict({
+      universe,
+      asset,
+      creator: owner,
+      systemProgram: anchor.web3.SystemProgram.programId,
+    })
     .rpc();
 
-  await stellar.methods.submitAsset().accountsStrict({ asset, creator: owner }).rpc();
-  await stellar.methods.approveAsset().accountsStrict({ universe, asset, owner }).rpc();
+  await stellar.methods
+    .submitAsset()
+    .accountsStrict({ asset, creator: owner })
+    .rpc();
+  await stellar.methods
+    .approveAsset()
+    .accountsStrict({ universe, asset, owner })
+    .rpc();
 
   await stellar.methods
     .createRelease(new anchor.BN(0), `Qm${label}ReleaseHash`)
-    .accountsStrict({ universe, asset, release, vault, owner, systemProgram: anchor.web3.SystemProgram.programId })
+    .accountsStrict({
+      universe,
+      asset,
+      release,
+      vault,
+      owner,
+      systemProgram: anchor.web3.SystemProgram.programId,
+    })
     .rpc();
 
   await stellar.methods
@@ -257,7 +284,9 @@ async function main() {
   // =========================================================================
   // STEP 2 — publish the release into Arena (the bridge instruction).
   // =========================================================================
-  console.log("\n[2] Publishing into Arena via register_arena_asset_from_stellar…");
+  console.log(
+    "\n[2] Publishing into Arena via register_arena_asset_from_stellar…"
+  );
   const arenaAssetIndex = await nextArenaAssetIndex();
   const arenaAsset = arenaAssetPda(arenaAssetIndex);
   const stellarLink = stellarArenaLinkPda(arenaAsset);
@@ -297,16 +326,35 @@ async function main() {
   // =========================================================================
   // STEP 3 — READ BACK + ASSERT the round-trip.
   // =========================================================================
-  console.log("\n[3] Reading ArenaAssetData back and asserting the round-trip…");
+  console.log(
+    "\n[3] Reading ArenaAssetData back and asserting the round-trip…"
+  );
   const a = await arenaAcc.arenaAssetData.fetch(arenaAsset);
 
-  check("card_kind == avatar", JSON.stringify(a.cardKind) === JSON.stringify({ avatar: {} }), JSON.stringify(a.cardKind));
-  check("archetype_id == arena_bridge_avatar", a.archetypeId === "arena_bridge_avatar", a.archetypeId);
+  check(
+    "card_kind == avatar",
+    JSON.stringify(a.cardKind) === JSON.stringify({ avatar: {} }),
+    JSON.stringify(a.cardKind)
+  );
+  check(
+    "archetype_id == arena_bridge_avatar",
+    a.archetypeId === "arena_bridge_avatar",
+    a.archetypeId
+  );
   check("slot_mask == 3", a.slotMask === 3, String(a.slotMask));
-  check("metadata_ipfs_hash preserved", a.metadataIpfsHash === "QmArenaBridgeValidateMetadata", a.metadataIpfsHash);
-  check("index == expected", a.index.toNumber() === arenaAssetIndex, String(a.index.toNumber()));
+  check(
+    "metadata_ipfs_hash preserved",
+    a.metadataIpfsHash === "QmArenaBridgeValidateMetadata",
+    a.metadataIpfsHash
+  );
+  check(
+    "index == expected",
+    a.index.toNumber() === arenaAssetIndex,
+    String(a.index.toNumber())
+  );
 
-  const skinAsset = a.skinRef && a.skinRef.stellarAsset ? a.skinRef.stellarAsset[0] : undefined;
+  const skinAsset =
+    a.skinRef && a.skinRef.stellarAsset ? a.skinRef.stellarAsset[0] : undefined;
   check(
     "skin_ref == StellarAsset(stellar asset pubkey)",
     !!skinAsset && skinAsset.toBase58() === asset.toBase58(),
@@ -315,28 +363,67 @@ async function main() {
 
   // Identity-only publish: caller stats must NOT leak into balance.
   const zeroStats =
-    a.baseStats.hp === 0 && a.baseStats.attack === 0 && a.baseStats.armor === 0 && a.baseStats.speed === 0 &&
-    a.statDelta.hp === 0 && a.statDelta.attack === 0 && a.statDelta.armor === 0 && a.statDelta.speed === 0;
+    a.baseStats.hp === 0 &&
+    a.baseStats.attack === 0 &&
+    a.baseStats.armor === 0 &&
+    a.baseStats.speed === 0 &&
+    a.statDelta.hp === 0 &&
+    a.statDelta.attack === 0 &&
+    a.statDelta.armor === 0 &&
+    a.statDelta.speed === 0;
   check("base_stats + stat_delta forced neutral (identity-only)", zeroStats);
 
   // ---- Arena-side link ----------------------------------------------------
   const link = await arenaAcc.stellarArenaAssetLink.fetch(stellarLink);
-  check("link.arena_asset == arenaAsset", link.arenaAsset.toBase58() === arenaAsset.toBase58());
-  check("link.release == stellar release", link.release.toBase58() === release.toBase58());
-  check("link.asset == stellar asset", link.asset.toBase58() === asset.toBase58());
+  check(
+    "link.arena_asset == arenaAsset",
+    link.arenaAsset.toBase58() === arenaAsset.toBase58()
+  );
+  check(
+    "link.release == stellar release",
+    link.release.toBase58() === release.toBase58()
+  );
+  check(
+    "link.asset == stellar asset",
+    link.asset.toBase58() === asset.toBase58()
+  );
 
-  const releaseLink = await arenaAcc.stellarReleaseLink.fetch(stellarReleaseLink);
-  check("release_link.arena_asset == arenaAsset", releaseLink.arenaAsset.toBase58() === arenaAsset.toBase58());
+  const releaseLink = await arenaAcc.stellarReleaseLink.fetch(
+    stellarReleaseLink
+  );
+  check(
+    "release_link.arena_asset == arenaAsset",
+    releaseLink.arenaAsset.toBase58() === arenaAsset.toBase58()
+  );
 
   // ---- Stellar-side deployment record (slug "arena") ----------------------
-  const deployment = await stellarAcc.releaseDeployment.fetch(stellarReleaseDeployment);
-  check("ReleaseDeployment.project_slug == 'arena'", deployment.projectSlug === "arena", deployment.projectSlug);
-  check("ReleaseDeployment.registry_program == Arena program", deployment.registryProgram.toBase58() === ARENA_PROGRAM_ID.toBase58());
-  check("ReleaseDeployment.registry_record == arenaAsset", deployment.registryRecord.toBase58() === arenaAsset.toBase58());
+  const deployment = await stellarAcc.releaseDeployment.fetch(
+    stellarReleaseDeployment
+  );
+  check(
+    "ReleaseDeployment.project_slug == 'arena'",
+    deployment.projectSlug === "arena",
+    deployment.projectSlug
+  );
+  check(
+    "ReleaseDeployment.registry_program == Arena program",
+    deployment.registryProgram.toBase58() === ARENA_PROGRAM_ID.toBase58()
+  );
+  check(
+    "ReleaseDeployment.registry_record == arenaAsset",
+    deployment.registryRecord.toBase58() === arenaAsset.toBase58()
+  );
 
   const linkedRelease = await stellarAcc.release.fetch(release);
-  check("Release.status == linked", JSON.stringify(linkedRelease.status) === JSON.stringify({ linked: {} }), JSON.stringify(linkedRelease.status));
-  check("Release.linked_avatar_data == arenaAsset", linkedRelease.linkedAvatarData.toBase58() === arenaAsset.toBase58());
+  check(
+    "Release.status == linked",
+    JSON.stringify(linkedRelease.status) === JSON.stringify({ linked: {} }),
+    JSON.stringify(linkedRelease.status)
+  );
+  check(
+    "Release.linked_avatar_data == arenaAsset",
+    linkedRelease.linkedAvatarData.toBase58() === arenaAsset.toBase58()
+  );
 
   // =========================================================================
   // VERDICT
@@ -346,7 +433,9 @@ async function main() {
   console.log("stellar_asset      = " + asset.toBase58());
   console.log("stellar_release    = " + release.toBase58());
   console.log("arena_asset_data   = " + arenaAsset.toBase58());
-  console.log("skin_ref_asset     = " + (skinAsset ? skinAsset.toBase58() : "undefined"));
+  console.log(
+    "skin_ref_asset     = " + (skinAsset ? skinAsset.toBase58() : "undefined")
+  );
   console.log("release_deployment = " + stellarReleaseDeployment.toBase58());
   console.log("publish_tx         = " + sig);
 
@@ -354,7 +443,9 @@ async function main() {
     console.log("\n==================== ROUND-TRIP: PASS ====================");
     process.exit(0);
   } else {
-    console.log(`\n==================== ROUND-TRIP: FAIL (${failures}) ====================`);
+    console.log(
+      `\n==================== ROUND-TRIP: FAIL (${failures}) ====================`
+    );
     process.exit(1);
   }
 }

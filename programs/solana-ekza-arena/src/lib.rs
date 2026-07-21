@@ -49,6 +49,22 @@ pub mod solana_ekza_arena {
         handlers::configure_registry(ctx, args)
     }
 
+    /// Transfer registry governance. Signed by the current authority.
+    pub fn rotate_registry_authority(
+        ctx: Context<RotateRegistryAuthority>,
+        new_authority: Pubkey,
+    ) -> Result<()> {
+        handlers::rotate_registry_authority(ctx, new_authority)
+    }
+
+    /// Upgrade-authority-gated migration of the legacy, smaller registry PDA.
+    pub fn migrate_registry_v1(
+        ctx: Context<MigrateRegistryV1>,
+        args: ConfigureRegistryArgs,
+    ) -> Result<()> {
+        handlers::migrate_registry_v1(ctx, args)
+    }
+
     /// Commit-reveal mint — step 1: lock a future slot + distribute the fee.
     pub fn commit_mint(ctx: Context<CommitMint>, args: CommitMintArgs) -> Result<()> {
         handlers::commit_mint(ctx, args)
@@ -58,6 +74,12 @@ pub mod solana_ekza_arena {
     /// `nonce` re-derives the `MintCommit` PDA.
     pub fn reveal_mint(ctx: Context<RevealMint>, nonce: u64) -> Result<()> {
         handlers::reveal_mint(ctx, nonce)
+    }
+
+    /// Permissionlessly close an expired commit; PDA rent always returns to
+    /// the original minter, never to the cleanup caller.
+    pub fn close_expired_commit(ctx: Context<CloseExpiredCommit>, nonce: u64) -> Result<()> {
+        handlers::close_expired_commit(ctx, nonce)
     }
 
     /// Create the player's character (one `PlayerAvatar` per wallet).

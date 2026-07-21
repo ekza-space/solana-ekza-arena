@@ -96,6 +96,15 @@ describe("solana-ekza-arena", () => {
       program.programId
     )[0];
 
+  const upgradeableLoader = new anchor.web3.PublicKey(
+    "BPFLoaderUpgradeab1e11111111111111111111111"
+  );
+  const arenaProgramData = () =>
+    anchor.web3.PublicKey.findProgramAddressSync(
+      [program.programId.toBuffer()],
+      upgradeableLoader
+    )[0];
+
   const u64Bytes = (value: number) =>
     new anchor.BN(value).toArrayLike(Buffer, "le", 8);
 
@@ -129,6 +138,7 @@ describe("solana-ekza-arena", () => {
   const CREATOR_FEE_LAMPORTS = 10_000_000;
   const PLATFORM_FEE_LAMPORTS = 8_000_000;
   const SINK_FEE_LAMPORTS = 2_000_000;
+  const COMMIT_REVEAL_WINDOW_SLOTS = 128;
   let nextCommitNonce = Date.now();
 
   const waitForSlotAfter = async (target: number) => {
@@ -358,9 +368,10 @@ describe("solana-ekza-arena", () => {
       release: anchor.web3.PublicKey;
       vault: anchor.web3.PublicKey;
     };
+    payer?: anchor.web3.Keypair;
   }) {
     const mint = anchor.web3.Keypair.generate();
-    const payer = provider.wallet.publicKey;
+    const payer = opts.payer?.publicKey ?? provider.wallet.publicKey;
     const ata = getAssociatedTokenAddressSync(mint.publicKey, payer);
     const arenaItem = arenaItemPda(mint.publicKey);
 
@@ -390,11 +401,57 @@ describe("solana-ekza-arena", () => {
         systemProgram: anchor.web3.SystemProgram.programId,
         rent: anchor.web3.SYSVAR_RENT_PUBKEY,
       })
-      .signers([mint])
+      // Metaplex metadata creation can sit close to the default 200k CU cap;
+      // make the proof deterministic across fresh validator builds.
+      .preInstructions([
+        anchor.web3.ComputeBudgetProgram.setComputeUnitLimit({
+          units: 400_000,
+        }),
+      ])
+      .signers(opts.payer ? [mint, opts.payer] : [mint])
       .rpc();
 
     return { mint: mint.publicKey, ata, arenaItem };
   }
+
+  it("rejects a first-caller registry takeover before bootstrap", async () => {
+    const attacker = anchor.web3.Keypair.generate();
+    const airdrop = await provider.connection.requestAirdrop(
+      attacker.publicKey,
+      anchor.web3.LAMPORTS_PER_SOL
+    );
+    await provider.connection.confirmTransaction(airdrop, "confirmed");
+
+    try {
+      await program.methods
+        .configureRegistry({
+          treasury: attacker.publicKey,
+          sink: attacker.publicKey,
+          commitFeeLamports: new anchor.BN(0),
+          creatorBps: 0,
+          platformBps: 10_000,
+          sinkBps: 0,
+        })
+        .accountsStrict({
+          registry: registryPda(),
+          payer: attacker.publicKey,
+          arenaProgram: program.programId,
+          programData: arenaProgramData(),
+          systemProgram: anchor.web3.SystemProgram.programId,
+        })
+        .signers([attacker])
+        .rpc();
+      expect.fail("non-upgrade-authority must not claim registry governance");
+    } catch (error) {
+      expect(String(error)).to.include(
+        "bootstrapped by a trusted or program upgrade authority"
+      );
+    }
+
+    expect(
+      await program.account.arenaRegistry.fetchNullable(registryPda())
+    ).to.equal(null);
+  });
 
   it("configures the 0.02 SOL fee and 50/40/10 split", async () => {
     await program.methods
@@ -409,6 +466,8 @@ describe("solana-ekza-arena", () => {
       .accountsStrict({
         registry: registryPda(),
         payer: provider.wallet.publicKey,
+        arenaProgram: program.programId,
+        programData: arenaProgramData(),
         systemProgram: anchor.web3.SystemProgram.programId,
       })
       .rpc();
@@ -430,6 +489,79 @@ describe("solana-ekza-arena", () => {
     );
   });
 
+  it("rotates registry authority without reopening bootstrap", async () => {
+    const nextAuthority = anchor.web3.Keypair.generate();
+    const airdrop = await provider.connection.requestAirdrop(
+      nextAuthority.publicKey,
+      anchor.web3.LAMPORTS_PER_SOL
+    );
+    await provider.connection.confirmTransaction(airdrop, "confirmed");
+
+    await program.methods
+      .rotateRegistryAuthority(nextAuthority.publicKey)
+      .accountsStrict({
+        registry: registryPda(),
+        configurationAuthority: provider.wallet.publicKey,
+      })
+      .rpc();
+
+    try {
+      await program.methods
+        .configureRegistry({
+          treasury: treasury.publicKey,
+          sink: sink.publicKey,
+          commitFeeLamports: new anchor.BN(COMMIT_FEE_LAMPORTS),
+          creatorBps: CREATOR_BPS,
+          platformBps: PLATFORM_BPS,
+          sinkBps: SINK_BPS,
+        })
+        .accountsStrict({
+          registry: registryPda(),
+          payer: provider.wallet.publicKey,
+          arenaProgram: program.programId,
+          programData: arenaProgramData(),
+          systemProgram: anchor.web3.SystemProgram.programId,
+        })
+        .rpc();
+      expect.fail("the previous authority must lose configure access");
+    } catch (error) {
+      expect(String(error)).to.include("Unauthorized action");
+    }
+
+    await program.methods
+      .configureRegistry({
+        treasury: treasury.publicKey,
+        sink: sink.publicKey,
+        commitFeeLamports: new anchor.BN(COMMIT_FEE_LAMPORTS),
+        creatorBps: CREATOR_BPS,
+        platformBps: PLATFORM_BPS,
+        sinkBps: SINK_BPS,
+      })
+      .accountsStrict({
+        registry: registryPda(),
+        payer: nextAuthority.publicKey,
+        arenaProgram: program.programId,
+        programData: arenaProgramData(),
+        systemProgram: anchor.web3.SystemProgram.programId,
+      })
+      .signers([nextAuthority])
+      .rpc();
+
+    await program.methods
+      .rotateRegistryAuthority(provider.wallet.publicKey)
+      .accountsStrict({
+        registry: registryPda(),
+        configurationAuthority: nextAuthority.publicKey,
+      })
+      .signers([nextAuthority])
+      .rpc();
+
+    const registry = await program.account.arenaRegistry.fetch(registryPda());
+    expect(registry.configurationAuthority.toBase58()).to.equal(
+      provider.wallet.publicKey.toBase58()
+    );
+  });
+
   it("rejects an invalid fee split and unauthorized reconfiguration", async () => {
     try {
       await program.methods
@@ -444,6 +576,8 @@ describe("solana-ekza-arena", () => {
         .accountsStrict({
           registry: registryPda(),
           payer: provider.wallet.publicKey,
+          arenaProgram: program.programId,
+          programData: arenaProgramData(),
           systemProgram: anchor.web3.SystemProgram.programId,
         })
         .rpc();
@@ -471,6 +605,8 @@ describe("solana-ekza-arena", () => {
         .accountsStrict({
           registry: registryPda(),
           payer: attacker.publicKey,
+          arenaProgram: program.programId,
+          programData: arenaProgramData(),
           systemProgram: anchor.web3.SystemProgram.programId,
         })
         .signers([attacker])
@@ -618,6 +754,27 @@ describe("solana-ekza-arena", () => {
     expect(linkedRelease.linkedAvatarData.toBase58()).to.equal(
       arenaAsset.toBase58()
     );
+  });
+
+  it("rejects the public free-mint bypass for a non-authority wallet", async () => {
+    const attacker = anchor.web3.Keypair.generate();
+    const airdrop = await provider.connection.requestAirdrop(
+      attacker.publicKey,
+      anchor.web3.LAMPORTS_PER_SOL
+    );
+    await provider.connection.confirmTransaction(airdrop, "confirmed");
+
+    try {
+      await mintArenaItemNft({
+        payer: attacker,
+        baseType: { weapon: {} },
+        skin: { builtin: [1] },
+        name: "Unauthorized Quick Mint",
+      });
+      expect.fail("a public wallet must not bypass commit-mint economics");
+    } catch (error) {
+      expect(String(error)).to.include("privileged development mint");
+    }
   });
 
   it("mints a real tradeable item NFT with rolled affixes (builtin skin, spec §11)", async () => {
@@ -1173,6 +1330,82 @@ describe("solana-ekza-arena", () => {
     console.log("E2E_PROOF reveal_minted_nft=" + mint.publicKey.toBase58());
     console.log("E2E_PROOF reveal_arena_item=" + arenaItem.toBase58());
     console.log("E2E_PROOF reveal_commit_closed=" + commitPda.toBase58());
+  });
+
+  it("permissionlessly closes an expired commit and returns rent only to its minter", async () => {
+    const minter = anchor.web3.Keypair.generate();
+    const closer = anchor.web3.Keypair.generate();
+    const airdrop = await provider.connection.requestAirdrop(
+      minter.publicKey,
+      anchor.web3.LAMPORTS_PER_SOL
+    );
+    await provider.connection.confirmTransaction(airdrop, "confirmed");
+    const nonce = nextCommitNonce++;
+    const commitPda = mintCommitPda(minter.publicKey, nonce);
+
+    await program.methods
+      .commitMint({
+        nonce: new anchor.BN(nonce),
+        baseType: { charm: {} },
+        skin: { builtin: [3] },
+        name: "Expiring Commit",
+        symbol: "EKZAITM",
+        uri: "https://meta.ekza.space/arena/expired.json",
+      })
+      .accountsStrict({
+        registry: registryPda(),
+        mintCommit: commitPda,
+        minter: minter.publicKey,
+        treasury: treasury.publicKey,
+        sink: sink.publicKey,
+        stellarProgram: null,
+        stellarRelease: null,
+        stellarVault: null,
+        systemProgram: anchor.web3.SystemProgram.programId,
+      })
+      .signers([minter])
+      .rpc();
+
+    const commit = await program.account.mintCommit.fetch(commitPda);
+    const commitInfo = await provider.connection.getAccountInfo(commitPda);
+    expect(commitInfo).to.not.equal(null);
+
+    try {
+      await program.methods
+        .closeExpiredCommit(new anchor.BN(nonce))
+        .accountsStrict({
+          mintCommit: commitPda,
+          minter: minter.publicKey,
+          closer: closer.publicKey,
+        })
+        .signers([closer])
+        .rpc();
+      expect.fail("a live commitment must not be closable");
+    } catch (error) {
+      expect(String(error)).to.include("has not expired yet");
+    }
+
+    await waitForSlotAfter(
+      commit.targetSlot.toNumber() + COMMIT_REVEAL_WINDOW_SLOTS
+    );
+    const minterBeforeClose = await provider.connection.getBalance(
+      minter.publicKey
+    );
+    await program.methods
+      .closeExpiredCommit(new anchor.BN(nonce))
+      .accountsStrict({
+        mintCommit: commitPda,
+        minter: minter.publicKey,
+        closer: closer.publicKey,
+      })
+      .signers([closer])
+      .rpc();
+
+    const minterAfterClose = await provider.connection.getBalance(
+      minter.publicKey
+    );
+    expect(minterAfterClose - minterBeforeClose).to.equal(commitInfo!.lamports);
+    expect(await provider.connection.getAccountInfo(commitPda)).to.equal(null);
   });
 
   it("1-tx mint_arena_item NEVER rolls Mythic (clamped at Legendary) + writes forward-compat defaults (spec §12.1/§12.3)", async () => {

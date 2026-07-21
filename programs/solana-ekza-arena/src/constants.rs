@@ -12,6 +12,17 @@ pub const MAX_BUILTIN_SKINS: u8 = 64;
 #[constant]
 pub const REGISTRY_SEED: &[u8] = b"arena_registry";
 
+/// Project-controlled genesis authority allowed to bootstrap a brand-new
+/// registry when the deployed ProgramData authority cannot sign (notably the
+/// local validator's system-program sentinel).
+///
+/// Real deployments should bootstrap with their ProgramData upgrade authority;
+/// this key is part of the binary's trust root and MUST be reviewed/replaced
+/// before every production deployment. It has no special power after bootstrap:
+/// only the authority stored in `ArenaRegistry` can configure or rotate then.
+pub const GENESIS_REGISTRY_AUTHORITY: Pubkey =
+    pubkey!("Ab5TgPbcB8QVuormXYXHzRVkV7okAbzkS2sU2neKoWvQ");
+
 #[constant]
 pub const MINT_COMMIT_SEED: &[u8] = b"mint_commit";
 
@@ -32,6 +43,15 @@ pub const EQUIPMENT_SEED: &[u8] = b"equipment";
 /// the mandatory "reveal-before-target is rejected" case is untestable). 5 slots
 /// is ~2s on localnet — still a tiny, sane anti-grind delay.
 pub const REVEAL_DELAY_SLOTS: u64 = 5;
+
+/// Deterministic lifetime of a paid mint commitment after its target slot.
+///
+/// Keeping an explicit bound makes stale commits recoverable without trusting
+/// a caller-provided clock or waiting for implementation-specific SlotHashes
+/// retention. At normal Solana slot times this leaves roughly 50 seconds after
+/// the target slot for the reveal transaction.
+#[constant]
+pub const COMMIT_REVEAL_WINDOW_SLOTS: u64 = 128;
 
 /// Recommended/default non-refundable commit fee (0.02 SOL). The actual value
 /// charged is governed by `ArenaRegistry::commit_fee_lamports`.

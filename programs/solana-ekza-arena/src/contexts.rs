@@ -446,6 +446,60 @@ pub struct ConfigureRegistry<'info> {
     #[account(mut)]
     pub payer: Signer<'info>,
 
+    /// The first configuration is authorized by the deployed program's actual
+    /// upgrade authority, not by whichever public signer races to this PDA.
+    #[account(
+        constraint = arena_program.programdata_address()? == Some(program_data.key())
+            @ ArenaRegistryError::InvalidProgramData
+    )]
+    pub arena_program: Program<'info, crate::program::SolanaEkzaArena>,
+    pub program_data: Account<'info, ProgramData>,
+
+    pub system_program: Program<'info, System>,
+}
+
+/// Rotate registry governance after the upgrade-authority-gated bootstrap.
+#[derive(Accounts)]
+pub struct RotateRegistryAuthority<'info> {
+    #[account(
+        mut,
+        seeds = [REGISTRY_SEED],
+        bump,
+        has_one = configuration_authority @ ArenaRegistryError::Unauthorized,
+    )]
+    pub registry: Account<'info, ArenaRegistry>,
+
+    pub configuration_authority: Signer<'info>,
+}
+
+/// One-time migration for the legacy registry layout
+/// `[next_index, treasury, commit_fee_lamports, bump]`.
+///
+/// `UncheckedAccount` is intentional: the old, shorter account cannot be
+/// deserialized as the current `ArenaRegistry`. The handler checks ownership,
+/// discriminator, exact legacy size and program upgrade authority before
+/// reallocating and serializing the current layout.
+#[derive(Accounts)]
+pub struct MigrateRegistryV1<'info> {
+    /// CHECK: Fully validated and deserialized manually in the handler.
+    #[account(
+        mut,
+        seeds = [REGISTRY_SEED],
+        bump,
+        owner = crate::ID,
+    )]
+    pub registry: UncheckedAccount<'info>,
+
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    #[account(
+        constraint = arena_program.programdata_address()? == Some(program_data.key())
+            @ ArenaRegistryError::InvalidProgramData
+    )]
+    pub arena_program: Program<'info, crate::program::SolanaEkzaArena>,
+    pub program_data: Account<'info, ProgramData>,
+
     pub system_program: Program<'info, System>,
 }
 
@@ -588,4 +642,28 @@ pub struct RevealMint<'info> {
     pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, System>,
     pub rent: Sysvar<'info, Rent>,
+}
+
+/// Permissionless cleanup of a commitment after its deterministic reveal
+/// window. The caller pays only the transaction fee; all PDA lamports return to
+/// the original minter and never to the caller.
+#[derive(Accounts)]
+#[instruction(nonce: u64)]
+pub struct CloseExpiredCommit<'info> {
+    #[account(
+        mut,
+        close = minter,
+        has_one = minter,
+        seeds = [MINT_COMMIT_SEED, minter.key().as_ref(), &nonce.to_le_bytes()],
+        bump = mint_commit.bump,
+    )]
+    pub mint_commit: Account<'info, MintCommit>,
+
+    /// CHECK: Address is bound by `mint_commit.minter`; receives the rent even
+    /// when a third party submits the cleanup transaction.
+    #[account(mut)]
+    pub minter: UncheckedAccount<'info>,
+
+    /// Any fee payer may clean up an expired commitment.
+    pub closer: Signer<'info>,
 }

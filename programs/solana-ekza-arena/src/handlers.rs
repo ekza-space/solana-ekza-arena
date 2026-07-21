@@ -11,20 +11,21 @@ use solana_stellar::state::ReleaseStatus;
 use crate::{
     affix::{roll_item, roll_item_capped, RARITY_LEGENDARY},
     constants::{
-        BPS_DENOMINATOR, ITEM_ROYALTY_BPS, MAX_BUILTIN_SKINS, RELEASE_DEPLOYMENT_PROJECT_ARENA,
-        REVEAL_DELAY_SLOTS,
+        BPS_DENOMINATOR, COMMIT_REVEAL_WINDOW_SLOTS, GENESIS_REGISTRY_AUTHORITY, ITEM_ROYALTY_BPS,
+        MAX_BUILTIN_SKINS, RELEASE_DEPLOYMENT_PROJECT_ARENA, REVEAL_DELAY_SLOTS,
     },
     contexts::{
-        CommitMint, ConfigureRegistry, CreatePlayerAvatar, CustomizeAvatar, EquipItem, EquipItemV2,
-        MintArenaItem, RegisterArenaAsset, RegisterArenaAssetFromStellar, RevealMint,
-        ScrapArenaItem, UnequipItem, UnequipItemV2,
+        CloseExpiredCommit, CommitMint, ConfigureRegistry, CreatePlayerAvatar, CustomizeAvatar,
+        EquipItem, EquipItemV2, MigrateRegistryV1, MintArenaItem, RegisterArenaAsset,
+        RegisterArenaAssetFromStellar, RevealMint, RotateRegistryAuthority, ScrapArenaItem,
+        UnequipItem, UnequipItemV2,
     },
     error::ArenaRegistryError,
     state::{
-        ArenaAffix, ArenaAssetData, ArenaCardKind, ArenaElement, ArenaRarity, ArenaStats,
-        CommitMintArgs, ConfigureRegistryArgs, CreatePlayerAvatarArgs, CustomizeAvatarArgs,
-        ItemSkin, MintArenaItemArgs, MintSkinArg, PlayerAvatar, RegisterArenaAssetArgs,
-        RegisterArenaAssetFromStellarArgs,
+        ArenaAffix, ArenaAssetData, ArenaCardKind, ArenaElement, ArenaRarity, ArenaRegistry,
+        ArenaStats, CommitMintArgs, ConfigureRegistryArgs, CreatePlayerAvatarArgs,
+        CustomizeAvatarArgs, ItemSkin, MintArenaItemArgs, MintSkinArg, PlayerAvatar,
+        RegisterArenaAssetArgs, RegisterArenaAssetFromStellarArgs,
     },
     utils::{deposit_revenue_to_stellar, validate_stellar_release, StellarReleaseOrigin},
     utils::{
@@ -354,6 +355,19 @@ pub fn mint_arena_item(ctx: Context<MintArenaItem>, args: MintArenaItemArgs) -> 
     // Validate caller-supplied NFT metadata strings (spec §11.2).
     validate_nft_metadata(&args.name, &args.symbol, &args.uri)?;
 
+    // The one-transaction path is deliberately a privileged development/admin
+    // tool. Public production minting must use commit_mint so the configured
+    // creator/platform/sink economics cannot be bypassed.
+    require!(
+        ctx.accounts.registry.configuration_authority != Pubkey::default(),
+        ArenaRegistryError::RegistryNotConfigured
+    );
+    require_keys_eq!(
+        ctx.accounts.registry.configuration_authority,
+        ctx.accounts.payer.key(),
+        ArenaRegistryError::QuickMintRestricted
+    );
+
     // Resolve the skin first (and validate Stellar accounts if required).
     let resolved_skin = resolve_skin(&ctx, args.skin)?;
     let royalty_recipient = resolved_skin
@@ -528,11 +542,7 @@ fn validate_nft_metadata(name: &str, symbol: &str, uri: &str) -> Result<()> {
     Ok(())
 }
 
-/// Configure the registry's commit-reveal economics (spec §12.1).
-pub fn configure_registry(
-    ctx: Context<ConfigureRegistry>,
-    args: ConfigureRegistryArgs,
-) -> Result<()> {
+fn validate_registry_config(args: &ConfigureRegistryArgs) -> Result<()> {
     let total_bps = u32::from(args.creator_bps)
         .checked_add(u32::from(args.platform_bps))
         .and_then(|value| value.checked_add(u32::from(args.sink_bps)))
@@ -549,9 +559,31 @@ pub fn configure_registry(
         args.sink != Pubkey::default(),
         ArenaRegistryError::InvalidSink
     );
+    Ok(())
+}
+
+fn require_program_upgrade_authority(
+    program_data: &Account<ProgramData>,
+    signer: Pubkey,
+) -> Result<()> {
+    require!(
+        signer == GENESIS_REGISTRY_AUTHORITY
+            || program_data.upgrade_authority_address == Some(signer),
+        ArenaRegistryError::UnauthorizedRegistryBootstrap
+    );
+    Ok(())
+}
+
+/// Configure the registry's commit-reveal economics (spec §12.1).
+pub fn configure_registry(
+    ctx: Context<ConfigureRegistry>,
+    args: ConfigureRegistryArgs,
+) -> Result<()> {
+    validate_registry_config(&args)?;
 
     let registry = &mut ctx.accounts.registry;
     if registry.configuration_authority == Pubkey::default() {
+        require_program_upgrade_authority(&ctx.accounts.program_data, ctx.accounts.payer.key())?;
         registry.configuration_authority = ctx.accounts.payer.key();
     } else {
         require_keys_eq!(
@@ -567,6 +599,78 @@ pub fn configure_registry(
     registry.creator_bps = args.creator_bps;
     registry.platform_bps = args.platform_bps;
     registry.sink_bps = args.sink_bps;
+    Ok(())
+}
+
+pub fn rotate_registry_authority(
+    ctx: Context<RotateRegistryAuthority>,
+    new_authority: Pubkey,
+) -> Result<()> {
+    require!(
+        new_authority != Pubkey::default(),
+        ArenaRegistryError::InvalidConfigurationAuthority
+    );
+    ctx.accounts.registry.configuration_authority = new_authority;
+    Ok(())
+}
+
+/// Legacy registry account bytes, including the 8-byte discriminator.
+const LEGACY_REGISTRY_ACCOUNT_SPACE: usize = 8 + 8 + 32 + 8 + 1;
+
+fn legacy_registry_next_index(data: &[u8]) -> Result<u64> {
+    require!(
+        data.len() == LEGACY_REGISTRY_ACCOUNT_SPACE && &data[..8] == ArenaRegistry::DISCRIMINATOR,
+        ArenaRegistryError::InvalidRegistryMigration
+    );
+    Ok(u64::from_le_bytes(data[8..16].try_into().map_err(
+        |_| ArenaRegistryError::InvalidRegistryMigration,
+    )?))
+}
+
+pub fn migrate_registry_v1(
+    ctx: Context<MigrateRegistryV1>,
+    args: ConfigureRegistryArgs,
+) -> Result<()> {
+    validate_registry_config(&args)?;
+    require_program_upgrade_authority(&ctx.accounts.program_data, ctx.accounts.payer.key())?;
+
+    let registry_info = ctx.accounts.registry.to_account_info();
+    let next_index = {
+        let data = registry_info.try_borrow_data()?;
+        legacy_registry_next_index(&data)?
+    };
+
+    let new_space = 8 + ArenaRegistry::INIT_SPACE;
+    let required_lamports = Rent::get()?.minimum_balance(new_space);
+    let top_up = required_lamports.saturating_sub(registry_info.lamports());
+    if top_up > 0 {
+        anchor_lang::system_program::transfer(
+            CpiContext::new(
+                ctx.accounts.system_program.to_account_info(),
+                anchor_lang::system_program::Transfer {
+                    from: ctx.accounts.payer.to_account_info(),
+                    to: registry_info.clone(),
+                },
+            ),
+            top_up,
+        )?;
+    }
+    registry_info.resize(new_space)?;
+
+    let migrated = ArenaRegistry {
+        next_index,
+        configuration_authority: ctx.accounts.payer.key(),
+        treasury: args.treasury,
+        sink: args.sink,
+        commit_fee_lamports: args.commit_fee_lamports,
+        creator_bps: args.creator_bps,
+        platform_bps: args.platform_bps,
+        sink_bps: args.sink_bps,
+        bump: ctx.bumps.registry,
+    };
+    let mut data = registry_info.try_borrow_mut_data()?;
+    data.fill(0);
+    migrated.try_serialize(&mut &mut data[..])?;
     Ok(())
 }
 
@@ -712,12 +816,23 @@ pub fn commit_mint(ctx: Context<CommitMint>, args: CommitMintArgs) -> Result<()>
 /// `reveal_mint` (spec §12.1): roll from the committed slot's now-known hash,
 /// mint the NFT (spec §11), write `ArenaItem`, and close the `MintCommit`.
 /// This is the ONLY path that can roll Mythic. Single-shot.
+fn commit_expires_after(target_slot: u64) -> Result<u64> {
+    target_slot
+        .checked_add(COMMIT_REVEAL_WINDOW_SLOTS)
+        .ok_or(ArenaRegistryError::NumericalOverflow.into())
+}
+
 pub fn reveal_mint(ctx: Context<RevealMint>, _nonce: u64) -> Result<()> {
     // 1. Enforce the reveal window: the target slot must have PASSED, and its
     //    hash must still be retrievable from SlotHashes (spec §12.1).
     let target_slot = ctx.accounts.mint_commit.target_slot;
     let now = Clock::get()?.slot;
     require!(now > target_slot, ArenaRegistryError::RevealTooEarly);
+    let expires_after = commit_expires_after(target_slot)?;
+    require!(
+        now <= expires_after,
+        ArenaRegistryError::RevealWindowExpired
+    );
     let slothash_u64 = slothash_of_slot(&ctx.accounts.slot_hashes, target_slot)?;
 
     // 2. Seed = splitmix64_mix(target_slothash ^ minter_first8 ^ commit_first8).
@@ -873,6 +988,18 @@ pub fn reveal_mint(ctx: Context<RevealMint>, _nonce: u64) -> Result<()> {
     Ok(())
 }
 
+pub fn close_expired_commit(ctx: Context<CloseExpiredCommit>, _nonce: u64) -> Result<()> {
+    let expires_after = commit_expires_after(ctx.accounts.mint_commit.target_slot)?;
+    require!(
+        Clock::get()?.slot > expires_after,
+        ArenaRegistryError::CommitNotExpired
+    );
+    // `close = minter` returns every lamport held by the PDA to the wallet that
+    // paid its rent. The non-refundable mint fee was distributed at commit and
+    // is never held here, so a permissionless closer cannot capture any value.
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Player avatar: character customization + on-chain equip.
 // ---------------------------------------------------------------------------
@@ -1000,6 +1127,7 @@ fn touch_equipment_record(
 ///   3. The avatar card supports the governing item class (`slot_mask` bit of
 ///      `base_type.slot_index()` — so slotMask semantics are unchanged).
 ///   4. NFT ownership — enforced by the context (signer's ATA holds the token).
+///
 /// Canonical slots also mirror into the legacy `PlayerAvatar::equipped` so
 /// pre-v2 readers keep working.
 pub fn equip_item_v2(ctx: Context<EquipItemV2>, slot: u8) -> Result<()> {
@@ -1055,4 +1183,65 @@ pub fn unequip_item_v2(ctx: Context<UnequipItemV2>, slot: u8) -> Result<()> {
         avatar.equipped[legacy] = Pubkey::default();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod registry_security_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_registry_decoder_accepts_only_the_exact_v1_layout() {
+        let expected_index = 42u64;
+        let mut data = vec![0u8; LEGACY_REGISTRY_ACCOUNT_SPACE];
+        data[..8].copy_from_slice(ArenaRegistry::DISCRIMINATOR);
+        data[8..16].copy_from_slice(&expected_index.to_le_bytes());
+        assert_eq!(legacy_registry_next_index(&data).unwrap(), expected_index);
+
+        let mut wrong_discriminator = data.clone();
+        wrong_discriminator[0] ^= 0xff;
+        assert!(legacy_registry_next_index(&wrong_discriminator).is_err());
+
+        data.push(0);
+        assert!(legacy_registry_next_index(&data).is_err());
+    }
+
+    #[test]
+    fn migrated_registry_serialization_writes_a_current_anchor_account() {
+        let registry = ArenaRegistry {
+            next_index: 42,
+            configuration_authority: Pubkey::new_unique(),
+            treasury: Pubkey::new_unique(),
+            sink: Pubkey::new_unique(),
+            commit_fee_lamports: 20_000_000,
+            creator_bps: 5_000,
+            platform_bps: 4_000,
+            sink_bps: 1_000,
+            bump: 254,
+        };
+        let mut data = vec![0u8; 8 + ArenaRegistry::INIT_SPACE];
+        registry.try_serialize(&mut &mut data[..]).unwrap();
+        assert_eq!(&data[..8], ArenaRegistry::DISCRIMINATOR);
+        let decoded = ArenaRegistry::try_deserialize(&mut data.as_slice()).unwrap();
+        assert_eq!(decoded.next_index, registry.next_index);
+        assert_eq!(
+            decoded.configuration_authority,
+            registry.configuration_authority
+        );
+        assert_eq!(decoded.treasury, registry.treasury);
+        assert_eq!(decoded.sink, registry.sink);
+        assert_eq!(decoded.commit_fee_lamports, registry.commit_fee_lamports);
+        assert_eq!(decoded.creator_bps, registry.creator_bps);
+        assert_eq!(decoded.platform_bps, registry.platform_bps);
+        assert_eq!(decoded.sink_bps, registry.sink_bps);
+        assert_eq!(decoded.bump, registry.bump);
+    }
+
+    #[test]
+    fn commitment_expiry_boundary_is_checked_and_overflow_safe() {
+        assert_eq!(
+            commit_expires_after(7).unwrap(),
+            7 + COMMIT_REVEAL_WINDOW_SLOTS
+        );
+        assert!(commit_expires_after(u64::MAX).is_err());
+    }
 }

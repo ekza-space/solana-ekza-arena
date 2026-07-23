@@ -1,0 +1,100 @@
+{
+  "schemaVersion": 1,
+  "cluster": "devnet",
+  "genesisHash": "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG",
+  "rpcUrl": "https://api.devnet.solana.com",
+  "deployedAt": "2026-07-23T13:16:41Z",
+  "deployer": "Ab5TgPbcB8QVuormXYXHzRVkV7okAbzkS2sU2neKoWvQ",
+  "upgradeAuthority": "Ab5TgPbcB8QVuormXYXHzRVkV7okAbzkS2sU2neKoWvQ",
+  "sources": {
+    "solanaStellar": {
+      "branch": "dev",
+      "commit": "47d232607ac84b4251002cc65963314e07913455"
+    },
+    "solanaEkzaArena": {
+      "branch": "main",
+      "commit": "6b7c017837ac904810e337677a1f774aa487511c"
+    }
+  },
+  "programs": {
+    "solanaStellar": {
+      "programId": "3rVXfq7LLSLqbDzvZuSrQoMytwczLj2Q8Hue62rxPZAA",
+      "programdataAddress": "92rtYpC3hcxnUKsi2E7kJgefmNsT2jNmv8zzG9gapi3W",
+      "lastDeploySlot": 478325429,
+      "dataLen": 602400,
+      "binarySha256": "3530a691ee94724ee80bc04a06bac5514610d2d2559b51c0d9937787396c8190",
+      "deploySignature": "4rLhjA36haqcyX86gWeAUq48MxxGvaT22yhvDopxkGg5L1xUNBufqs6VjxDapExKp6Lhv67JWUGRKPziZ5nm7AqG"
+    },
+    "solanaEkzaArena": {
+      "programId": "D3a99Wj3eLLn4jbXU5rLDbaFT6giQiUbmcPkiyQSM8iZ",
+      "programdataAddress": "BkEE9MohpLthgBjUjB3d8BdEZGeTZxeCP4ngXuaBPQPM",
+      "lastDeploySlot": 478325585,
+      "dataLen": 786400,
+      "binarySha256": "a115ab539c3ba80ac410fd8e5cbecce6409a13ffaa7500cc5aff1289456ccfee",
+      "deploySignature": "mEmiP2fKgXL8BDVJDyFRy2ETznfYqctpLjPVqDJAdPgsubbRG3H2pq4MH7WLECquGYGXbPyroZBCrKdjFGxtb5F"
+    },
+    "arenaLeaderboard": {
+      "programId": "9A5PkCQrsp98SNBfVRiRs5zVdnzxVdRZQFy2ZDDGjaeU",
+      "programdataAddress": "6grSTXx5HMs4bfpktRi1cZKF4UCR9hSbbFtmVeasrjFz",
+      "lastDeploySlot": 478325634,
+      "dataLen": 270792,
+      "binarySha256": "87433f537323521b6ac6477cc703a4064212d63cf8a8563b2b9617e819673d90",
+      "deploySignature": "5qtKk7pRJQDBXGG6ruqGWkAzeyhqXDYohivcMRmX37cAXx3jnxkuFkznm3Y6mg5mSiH5MVdGsYtBEFJUuUiRDAzV"
+    }
+  },
+  "arenaRegistry": {
+    "address": "4x25bbbKGuA4p46XXiV5sMb4FV4C1x7zNKtkvbusJXUV",
+    "configurationAuthority": "Ab5TgPbcB8QVuormXYXHzRVkV7okAbzkS2sU2neKoWvQ",
+    "treasury": "Ab5TgPbcB8QVuormXYXHzRVkV7okAbzkS2sU2neKoWvQ",
+    "sink": "CyiV8EG8gGhT1WCV8YaLJ9raf9DpxZ3g4FdkoXL9yt3u",
+    "sinkFundingSignature": "65H1ber6wC2NRi79TWcr23aeNcsmHsBKgrwzFi8pDHM3Jfy765bwW32XUk4vUnpHQe21sgmcTisCgTpxgUkQ6nQb",
+    "commitFeeLamports": 2000000,
+    "creatorBps": 5000,
+    "platformBps": 4000,
+    "sinkBps": 1000,
+    "configureSignature": "2zPLyAuVAd5yr14wj3P2ibdVRrH7HDFprZP7nmpL4kiu2qg55aauwNCrKFtwapigzUmMWrrJ9zE9deFTcdbDLmiL"
+  },
+  "leaderboard": {
+    "address": "MfVv4UTLu7cwJxzhMZ25QCg8usjtA4srCvgEKxJ9rto",
+    "authority": "Ab5TgPbcB8QVuormXYXHzRVkV7okAbzkS2sU2neKoWvQ",
+    "capacity": 1000,
+    "accountBytes": 40048,
+    "initSignature": "rMpuTUdukdeoAqwohNHFHttAXgUinpdMshw96JUSDZJ85PEZpnypisNwhc7R65ksmHiW87VNmXzh53q6GfgDBi4"
+  },
+  "bridgeSmokeProof": {
+    "stellarUniverse": "7ryynfK3xpstUY7bA2aL9aYUcx1PVBjNFBzgr4BYSALK",
+    "stellarAsset": "Cg7LJDy6Wi1ad7uC6rhwZPTrS5dSFVSJ5wgeHjeMZaM9",
+    "stellarRelease": "72Srd7F1o78dLcZwwMFXA7JixAV2YpxxbPDFAXj2LgQL",
+    "arenaAssetData": "EfUskYYwLwac5QrFyTmPB7CtLv6C7UBBcf9HesZgq9ZM",
+    "releaseDeployment": "9YZBNHQ48qXqdsmdDcrTk4LQA9V3ry5A6VE736Pi2TJf",
+    "publishSignature": "52NvfqKVYkmAxpvK1T7F9kxZqmWdEkvjz7NU9VN4W3uzTkxS1Hso71CyjcoR4yLDpntVgr4JAeWPTNWEXudWRMmx",
+    "result": "pass"
+  },
+  "leaderboardSmokeProof": {
+    "signature": "cTqEkHpxWsmrGZUSr4BQiu91yAhr987uKcUPVbTVF5QP2XZo1vGk5FFhnHnZhAbMNbJaJ1pMSKSYZta64HKYskC",
+    "player": "Ab5TgPbcB8QVuormXYXHzRVkV7okAbzkS2sU2neKoWvQ",
+    "playerStats": "AeETLhbvkMLjgKBCfwTy7j8dWTariZ7jQL4aJUPpVvgF",
+    "battleRateLimit": "BE75UJcU832VT8iCLhdQ5tZiiwfr3TccvNSKgn9UCQnX",
+    "games": 1,
+    "wins": 1,
+    "rating": 1010,
+    "boardSize": 1,
+    "result": "pass"
+  },
+  "mintSmokeProof": {
+    "minter": "FVUuqNcd9D86EfNmV31TTC8JN3G8cwcRr1kKhgnULz6b",
+    "minterFundingSignature": "k3vT8G5Q7fDX3WYhqdB6CRsVqYrBV6Jft9DxRskQtbM3sBeH2cb1i6utpqJzzQb4pnb5k8Ag7CX8S5V8XrpPgVn",
+    "commitSignature": "3UNinVpboUSUCYyEiHmynd7BRBfmmmXftqcbtoRMH6DDwcgdTmdSP9YhKtqsHEwBFXBqKF8gRZSPX9xZjcEjsZdB",
+    "revealSignature": "4ujnDeKZF2bFhVMvA47G5edPz5SieD9nqA1zRkt73i3aYKV3Y8jyhFSPvZ9JS51yGGkNADNo8qRDZgzCwXuDRyjY",
+    "mint": "EVTjgnALVbp8U3S5bbcp33ahBJAG52bafvvHwBguUu7Z",
+    "tokenAccount": "DXW2q5qtjGdiaHemLFWdxKEcbknmY7WNoZm858VLEA35",
+    "arenaItem": "6SvPX1BGfM6BUmf7UMVCzRfeRbiATUghBtMsR12wQvab",
+    "metadataUri": "https://ipfs.io/ipfs/QmU8ivuQxWtP3sAkoEVq4b6hUXperuu6bFGaf631ZD55FQ",
+    "feeLamports": 2000000,
+    "treasuryDeltaLamports": 1800000,
+    "sinkDeltaLamports": 200000,
+    "supply": "1",
+    "decimals": 0,
+    "result": "pass"
+  }
+}

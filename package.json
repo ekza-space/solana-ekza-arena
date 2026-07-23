@@ -3,6 +3,8 @@
   "scripts": {
     "lint:fix": "prettier */*.js \"*/**/*{.js,.ts}\" -w",
     "lint": "prettier */*.js \"*/**/*{.js,.ts}\" --check",
+    "bootstrap:devnet": "TS_NODE_TRANSPILE_ONLY=1 ts-node scripts/bootstrap-devnet.ts",
+    "smoke:devnet:leaderboard": "TS_NODE_TRANSPILE_ONLY=1 ts-node scripts/smoke-devnet-leaderboard.ts",
     "validate:bridge": "TS_NODE_TRANSPILE_ONLY=1 ts-node scripts/validate-bridge.ts",
     "validate:leaderboard": "TS_NODE_TRANSPILE_ONLY=1 ts-node scripts/validate-leaderboard.ts"
   },

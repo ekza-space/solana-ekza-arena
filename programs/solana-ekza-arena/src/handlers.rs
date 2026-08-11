@@ -11,21 +11,24 @@ use solana_stellar::state::ReleaseStatus;
 use crate::{
     affix::{roll_item, roll_item_capped, RARITY_LEGENDARY},
     constants::{
-        BPS_DENOMINATOR, COMMIT_REVEAL_WINDOW_SLOTS, GENESIS_REGISTRY_AUTHORITY, ITEM_ROYALTY_BPS,
-        MAX_BUILTIN_SKINS, RELEASE_DEPLOYMENT_PROJECT_ARENA, REVEAL_DELAY_SLOTS,
+        BPS_DENOMINATOR, COMMIT_REVEAL_WINDOW_SLOTS, ENHANCE_COMMIT_SEED, ENHANCE_ROLL_DENOMINATOR,
+        GENESIS_REGISTRY_AUTHORITY, ITEM_ROYALTY_BPS, MAX_BUILTIN_SKINS, MAX_ENHANCE_LEVEL,
+        RELEASE_DEPLOYMENT_PROJECT_ARENA, REVEAL_DELAY_SLOTS, SCROLL_FEE_MULTIPLIER, SCROLL_SYMBOL,
+        SUCCESS_BPS,
     },
     contexts::{
-        CloseExpiredCommit, CommitMint, ConfigureRegistry, CreatePlayerAvatar, CustomizeAvatar,
-        EquipItem, EquipItemV2, MigrateRegistryV1, MintArenaItem, RegisterArenaAsset,
-        RegisterArenaAssetFromStellar, RevealMint, RotateRegistryAuthority, ScrapArenaItem,
-        UnequipItem, UnequipItemV2,
+        CloseExpiredCommit, CloseExpiredEnhanceCommit, CommitEnhance, CommitMint,
+        ConfigureRegistry, CreatePlayerAvatar, CustomizeAvatar, EquipItem, EquipItemV2,
+        MigrateRegistryV1, MintArenaItem, MintEnhanceScroll, RegisterArenaAsset,
+        RegisterArenaAssetFromStellar, RevealEnhance, RevealMint, RotateRegistryAuthority,
+        ScrapArenaItem, UnequipItem, UnequipItemV2,
     },
     error::ArenaRegistryError,
     state::{
         ArenaAffix, ArenaAssetData, ArenaCardKind, ArenaElement, ArenaRarity, ArenaRegistry,
         ArenaStats, CommitMintArgs, ConfigureRegistryArgs, CreatePlayerAvatarArgs,
-        CustomizeAvatarArgs, ItemSkin, MintArenaItemArgs, MintSkinArg, PlayerAvatar,
-        RegisterArenaAssetArgs, RegisterArenaAssetFromStellarArgs,
+        CustomizeAvatarArgs, EnhanceResult, ItemSkin, MintArenaItemArgs, MintEnhanceScrollArgs,
+        MintSkinArg, PlayerAvatar, RegisterArenaAssetArgs, RegisterArenaAssetFromStellarArgs,
     },
     utils::{deposit_revenue_to_stellar, validate_stellar_release, StellarReleaseOrigin},
     utils::{
@@ -1023,6 +1026,488 @@ pub fn close_expired_commit(ctx: Context<CloseExpiredCommit>, _nonce: u64) -> Re
 }
 
 // ---------------------------------------------------------------------------
+// Item enhancement («заточка», docs/enhancement-design.md): consumable scroll
+// NFTs + commit-reveal upgrade rolls off SlotHashes.
+// ---------------------------------------------------------------------------
+
+/// Commit guard shared with the unit tests: an item at the level cap can never
+/// enter another attempt (the SUCCESS_BPS table has no row past +9→+10).
+fn require_enhance_committable(level: u8) -> Result<()> {
+    require!(
+        level < MAX_ENHANCE_LEVEL,
+        ArenaRegistryError::EnhanceLevelMaxed
+    );
+    Ok(())
+}
+
+/// `mint_enhance_scroll`: sell one consumable EnhanceScroll NFT for
+/// `registry.commit_fee_lamports × SCROLL_FEE_MULTIPLIER`, split exactly like
+/// a non-Stellar `commit_mint` (no creator on this path, so the creator share
+/// folds into platform: sink slice by `sink_bps`, remainder → treasury). The
+/// `["scroll", scroll_mint]` marker PDA is the proof-of-purchase gate.
+pub fn mint_enhance_scroll(
+    ctx: Context<MintEnhanceScroll>,
+    args: MintEnhanceScrollArgs,
+) -> Result<()> {
+    validate_nft_metadata(&args.name, SCROLL_SYMBOL, &args.uri)?;
+
+    let registry = &ctx.accounts.registry;
+    require!(
+        registry.configuration_authority != Pubkey::default()
+            && registry.treasury != Pubkey::default()
+            && registry.sink != Pubkey::default(),
+        ArenaRegistryError::RegistryNotConfigured
+    );
+    require_keys_eq!(
+        ctx.accounts.treasury.key(),
+        registry.treasury,
+        ArenaRegistryError::InvalidTreasury
+    );
+    require_keys_eq!(
+        ctx.accounts.sink.key(),
+        registry.sink,
+        ArenaRegistryError::InvalidSink
+    );
+
+    let fee = registry
+        .commit_fee_lamports
+        .checked_mul(SCROLL_FEE_MULTIPLIER)
+        .ok_or(ArenaRegistryError::NumericalOverflow)?;
+    let sink_amount = fee_slice(fee, registry.sink_bps)?;
+    let platform_amount = fee
+        .checked_sub(sink_amount)
+        .ok_or(ArenaRegistryError::NumericalOverflow)?;
+    require_rent_safe_fee_destination(&ctx.accounts.treasury.to_account_info(), platform_amount)?;
+    require_rent_safe_fee_destination(&ctx.accounts.sink.to_account_info(), sink_amount)?;
+    if platform_amount > 0 {
+        anchor_lang::system_program::transfer(
+            CpiContext::new(
+                ctx.accounts.system_program.to_account_info(),
+                anchor_lang::system_program::Transfer {
+                    from: ctx.accounts.buyer.to_account_info(),
+                    to: ctx.accounts.treasury.to_account_info(),
+                },
+            ),
+            platform_amount,
+        )?;
+    }
+    if sink_amount > 0 {
+        anchor_lang::system_program::transfer(
+            CpiContext::new(
+                ctx.accounts.system_program.to_account_info(),
+                anchor_lang::system_program::Transfer {
+                    from: ctx.accounts.buyer.to_account_info(),
+                    to: ctx.accounts.sink.to_account_info(),
+                },
+            ),
+            sink_amount,
+        )?;
+    }
+
+    // Mint the scroll NFT (supply 1, decimals 0, Master Edition) — the exact
+    // shape of the item mints so any wallet/marketplace displays it.
+    mint_to(
+        CpiContext::new(
+            ctx.accounts.token_program.to_account_info(),
+            MintTo {
+                mint: ctx.accounts.scroll_mint.to_account_info(),
+                to: ctx.accounts.buyer_token_account.to_account_info(),
+                authority: ctx.accounts.buyer.to_account_info(),
+            },
+        ),
+        1,
+    )?;
+
+    let royalty_recipient = registry.treasury;
+    let data = DataV2 {
+        name: args.name,
+        symbol: SCROLL_SYMBOL.to_string(),
+        uri: args.uri,
+        seller_fee_basis_points: ITEM_ROYALTY_BPS,
+        creators: Some(vec![Creator {
+            address: royalty_recipient,
+            verified: royalty_recipient == ctx.accounts.buyer.key(),
+            share: 100,
+        }]),
+        collection: None,
+        uses: None,
+    };
+    create_metadata_accounts_v3(
+        CpiContext::new(
+            ctx.accounts.token_metadata_program.to_account_info(),
+            CreateMetadataAccountsV3 {
+                metadata: ctx.accounts.metadata_account.to_account_info(),
+                mint: ctx.accounts.scroll_mint.to_account_info(),
+                mint_authority: ctx.accounts.buyer.to_account_info(),
+                payer: ctx.accounts.buyer.to_account_info(),
+                update_authority: ctx.accounts.buyer.to_account_info(),
+                system_program: ctx.accounts.system_program.to_account_info(),
+                rent: ctx.accounts.rent.to_account_info(),
+            },
+        ),
+        data,
+        false, // is_mutable
+        true,  // update_authority_is_signer
+        None,  // collection_details
+    )?;
+
+    create_master_edition_v3(
+        CpiContext::new(
+            ctx.accounts.token_metadata_program.to_account_info(),
+            CreateMasterEditionV3 {
+                edition: ctx.accounts.master_edition.to_account_info(),
+                mint: ctx.accounts.scroll_mint.to_account_info(),
+                update_authority: ctx.accounts.buyer.to_account_info(),
+                mint_authority: ctx.accounts.buyer.to_account_info(),
+                payer: ctx.accounts.buyer.to_account_info(),
+                metadata: ctx.accounts.metadata_account.to_account_info(),
+                token_program: ctx.accounts.token_program.to_account_info(),
+                system_program: ctx.accounts.system_program.to_account_info(),
+                rent: ctx.accounts.rent.to_account_info(),
+            },
+        ),
+        Some(0),
+    )?;
+
+    let marker = &mut ctx.accounts.scroll_marker;
+    marker.scroll_mint = ctx.accounts.scroll_mint.key();
+    marker.bump = ctx.bumps.scroll_marker;
+
+    Ok(())
+}
+
+/// Audit guard: an item wagered on an enhancement roll must not sit in any
+/// equip slot. Both PDAs are address-bound by seeds in the context and may be
+/// uninitialized (no avatar / no record yet) — only live, program-owned
+/// accounts are deserialized and checked.
+fn require_item_not_equipped(
+    player_avatar: &AccountInfo,
+    equipment_record: &AccountInfo,
+    item_mint: &Pubkey,
+) -> Result<()> {
+    if player_avatar.owner == &crate::ID && !player_avatar.data_is_empty() {
+        let data = player_avatar.try_borrow_data()?;
+        let avatar = PlayerAvatar::try_deserialize(&mut &**data)?;
+        require!(
+            !avatar.equipped.iter().any(|slot| slot == item_mint),
+            ArenaRegistryError::ItemEquipped
+        );
+    }
+    if equipment_record.owner == &crate::ID && !equipment_record.data_is_empty() {
+        let data = equipment_record.try_borrow_data()?;
+        let record = crate::state::EquipmentRecord::try_deserialize(&mut &**data)?;
+        require!(
+            !record.slots.iter().any(|slot| slot == item_mint),
+            ArenaRegistryError::ItemEquipped
+        );
+    }
+    Ok(())
+}
+
+/// `commit_enhance`: persist the attempt intent, lock a FUTURE slot, and
+/// escrow BOTH the scroll AND the item into the commit PDA's ATAs (v1.2 —
+/// the item escrow makes the permissionless failure burn irrevocable; an SPL
+/// delegate could be revoked or cleared by the owner to dodge a peeked loss).
+/// No roll happens here — same revert-grind-resistant shape as `commit_mint`.
+pub fn commit_enhance(ctx: Context<CommitEnhance>, nonce: u64) -> Result<()> {
+    use anchor_spl::token::{transfer_checked, TransferChecked};
+
+    let item_mint = ctx.accounts.item_mint.key();
+
+    // No gambling with equipped gear (audit guard).
+    require_item_not_equipped(
+        &ctx.accounts.player_avatar,
+        &ctx.accounts.equipment_record,
+        &item_mint,
+    )?;
+
+    let enhancement = &mut ctx.accounts.enhancement;
+    require_enhance_committable(enhancement.level)?;
+    require!(!enhancement.pending, ArenaRegistryError::EnhancePending);
+    // Idempotent identity stamp — first commit initializes, later ones re-affirm.
+    enhancement.item_mint = item_mint;
+    enhancement.pending = true;
+    enhancement.bump = ctx.bumps.enhancement;
+
+    // Escrow the scroll: it can no longer be sold or re-committed while the
+    // outcome is pending.
+    transfer_checked(
+        CpiContext::new(
+            ctx.accounts.token_program.to_account_info(),
+            TransferChecked {
+                from: ctx.accounts.scroll_token_account.to_account_info(),
+                mint: ctx.accounts.scroll_mint.to_account_info(),
+                to: ctx.accounts.scroll_escrow.to_account_info(),
+                authority: ctx.accounts.owner.to_account_info(),
+            },
+        ),
+        1,
+        0,
+    )?;
+
+    // Escrow the item (v1.2): hard-lock — the owner cannot transfer it away
+    // or shield it from the failure burn once the odds are locked in.
+    transfer_checked(
+        CpiContext::new(
+            ctx.accounts.token_program.to_account_info(),
+            TransferChecked {
+                from: ctx.accounts.item_token_account.to_account_info(),
+                mint: ctx.accounts.item_mint.to_account_info(),
+                to: ctx.accounts.item_escrow.to_account_info(),
+                authority: ctx.accounts.owner.to_account_info(),
+            },
+        ),
+        1,
+        0,
+    )?;
+
+    let target_slot = Clock::get()?
+        .slot
+        .checked_add(REVEAL_DELAY_SLOTS)
+        .ok_or(ArenaRegistryError::NumericalOverflow)?;
+
+    let commit = &mut ctx.accounts.enhance_commit;
+    commit.owner = ctx.accounts.owner.key();
+    commit.nonce = nonce;
+    commit.item_mint = item_mint;
+    commit.scroll_mint = ctx.accounts.scroll_mint.key();
+    commit.target_slot = target_slot;
+    commit.bump = ctx.bumps.enhance_commit;
+
+    Ok(())
+}
+
+/// `reveal_enhance` — PERMISSIONLESS: any signer may reveal a pending commit
+/// once its target slot passes, so a peeked loss can be forced through by a
+/// rival or keeper. The item sits in escrow (v1.2), out of the owner's reach.
+/// Success bumps the level (mirrored into `ArenaItem.enhance_level`) and
+/// returns the item; a risky-zone failure (only reachable from +3 up, where
+/// `SUCCESS_BPS[level] < 1000`) burns the item NFT from escrow and closes its
+/// `ArenaItem` and `ItemEnhancement` PDAs (rent → owner). The scroll burns
+/// from escrow REGARDLESS of outcome. Single-shot.
+pub fn reveal_enhance(ctx: Context<RevealEnhance>, nonce: u64) -> Result<()> {
+    use anchor_lang::AccountsClose;
+    use anchor_spl::metadata::{burn_nft, BurnNft};
+    use anchor_spl::token::{close_account, transfer_checked, CloseAccount, TransferChecked};
+
+    // 1. Reveal window: identical policy to reveal_mint.
+    let target_slot = ctx.accounts.enhance_commit.target_slot;
+    let now = Clock::get()?.slot;
+    require!(now > target_slot, ArenaRegistryError::RevealTooEarly);
+    require!(
+        now <= commit_expires_after(target_slot)?,
+        ArenaRegistryError::RevealWindowExpired
+    );
+    let slothash_u64 = slothash_of_slot(&ctx.accounts.slot_hashes, target_slot)?;
+
+    // 2. Seed = splitmix64_mix(target_slothash ^ owner_first8 ^ item_first8 ^
+    //    nonce) — the same first-8-LE-bytes mixing style as reveal_mint, over
+    //    the spec's (slot_hash ++ owner ++ item_mint ++ nonce) inputs. The
+    //    SDK/tests re-derive the roll from the same sysvar entry.
+    let owner_key = ctx.accounts.owner.key();
+    let owner_first8 = u64::from_le_bytes(owner_key.to_bytes()[0..8].try_into().unwrap());
+    let item_mint_key = ctx.accounts.item_mint.key();
+    let item_first8 = u64::from_le_bytes(item_mint_key.to_bytes()[0..8].try_into().unwrap());
+    let seed = crate::affix::splitmix64_mix(slothash_u64 ^ owner_first8 ^ item_first8 ^ nonce);
+
+    // 3. Roll against the one-const per-mille table, indexed by CURRENT level.
+    let level_before = ctx.accounts.enhancement.level;
+    require!(
+        level_before < MAX_ENHANCE_LEVEL,
+        ArenaRegistryError::EnhanceLevelMaxed
+    );
+    let roll = (seed % ENHANCE_ROLL_DENOMINATOR) as u16;
+    let success = roll < SUCCESS_BPS[level_before as usize];
+
+    // 4. Burn the scroll from escrow regardless of outcome (supply sink). The
+    //    commit PDA owns the escrow ATA and signs the CPI; the token-account/
+    //    metadata/edition refunds credit the commit PDA, whose `close = owner`
+    //    constraint then forwards every lamport to the owner.
+    let nonce_bytes = nonce.to_le_bytes();
+    let commit_bump = ctx.accounts.enhance_commit.bump;
+    let commit_signer: &[&[u8]] = &[
+        ENHANCE_COMMIT_SEED,
+        owner_key.as_ref(),
+        &nonce_bytes,
+        &[commit_bump],
+    ];
+    burn_nft(
+        CpiContext::new_with_signer(
+            ctx.accounts.token_metadata_program.to_account_info(),
+            BurnNft {
+                metadata: ctx.accounts.scroll_metadata.to_account_info(),
+                owner: ctx.accounts.enhance_commit.to_account_info(),
+                mint: ctx.accounts.scroll_mint.to_account_info(),
+                token: ctx.accounts.scroll_escrow.to_account_info(),
+                edition: ctx.accounts.scroll_master_edition.to_account_info(),
+                spl_token: ctx.accounts.token_program.to_account_info(),
+            },
+            &[commit_signer],
+        ),
+        None,
+    )?;
+
+    // 5. Apply the outcome.
+    let destroyed = !success;
+    let enhancement = &mut ctx.accounts.enhancement;
+    enhancement.attempts = enhancement.attempts.saturating_add(1);
+    enhancement.pending = false;
+    if success {
+        enhancement.level = level_before + 1;
+        // Mirror into the legacy field so pre-enhancement readers of
+        // `ArenaItem` stay coherent; `ItemEnhancement.level` remains the
+        // authoritative value (the two are only ever written together here).
+        ctx.accounts.arena_item.enhance_level = level_before + 1;
+
+        // Return the escrowed item to the owner and close the escrow ATA
+        // (rent → owner). The commit PDA signs both CPIs.
+        transfer_checked(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                TransferChecked {
+                    from: ctx.accounts.item_escrow.to_account_info(),
+                    mint: ctx.accounts.item_mint.to_account_info(),
+                    to: ctx.accounts.item_token_account.to_account_info(),
+                    authority: ctx.accounts.enhance_commit.to_account_info(),
+                },
+                &[commit_signer],
+            ),
+            1,
+            0,
+        )?;
+        close_account(CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            CloseAccount {
+                account: ctx.accounts.item_escrow.to_account_info(),
+                destination: ctx.accounts.owner.to_account_info(),
+                authority: ctx.accounts.enhance_commit.to_account_info(),
+            },
+            &[commit_signer],
+        ))?;
+    } else {
+        // Risky-zone failure: destroy the item FROM ESCROW — the owner cannot
+        // front-run this with a transfer or revoke (v1.2). Full Metaplex
+        // teardown: token + escrow ATA + metadata + master edition, refunds
+        // credited to the commit PDA → forwarded to the owner. The game-level
+        // item dies with its PDAs: `ArenaItem` (source of truth) and
+        // `ItemEnhancement` close to the owner.
+        burn_nft(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_metadata_program.to_account_info(),
+                BurnNft {
+                    metadata: ctx.accounts.item_metadata.to_account_info(),
+                    owner: ctx.accounts.enhance_commit.to_account_info(),
+                    mint: ctx.accounts.item_mint.to_account_info(),
+                    token: ctx.accounts.item_escrow.to_account_info(),
+                    edition: ctx.accounts.item_master_edition.to_account_info(),
+                    spl_token: ctx.accounts.token_program.to_account_info(),
+                },
+                &[commit_signer],
+            ),
+            None,
+        )?;
+        ctx.accounts
+            .arena_item
+            .close(ctx.accounts.owner.to_account_info())?;
+        ctx.accounts
+            .enhancement
+            .close(ctx.accounts.owner.to_account_info())?;
+    }
+
+    emit!(EnhanceResult {
+        item_mint: item_mint_key,
+        level_before,
+        success,
+        destroyed,
+    });
+
+    // 6. `EnhanceCommit` + `EnhanceScrollMarker` close via their `close =
+    //    owner` constraints. Single-shot: this commit can never re-roll.
+    Ok(())
+}
+
+/// Permissionless cleanup of an expired enhancement commit: return the
+/// escrowed ITEM to the owner (v1.2) but BURN the escrowed scroll — no
+/// refund, so peek-and-abandon always costs the full ticket — release the
+/// item's `pending` lock, and close the commit + marker (all rent/refunds →
+/// owner, never the closer). Fee-free.
+pub fn close_expired_enhance_commit(
+    ctx: Context<CloseExpiredEnhanceCommit>,
+    nonce: u64,
+) -> Result<()> {
+    use anchor_spl::metadata::{burn_nft, BurnNft};
+    use anchor_spl::token::{close_account, transfer_checked, CloseAccount, TransferChecked};
+
+    let expires_after = commit_expires_after(ctx.accounts.enhance_commit.target_slot)?;
+    require!(
+        Clock::get()?.slot > expires_after,
+        ArenaRegistryError::CommitNotExpired
+    );
+
+    let owner_key = ctx.accounts.enhance_commit.owner;
+    let nonce_bytes = nonce.to_le_bytes();
+    let commit_bump = ctx.accounts.enhance_commit.bump;
+    let commit_signer: &[&[u8]] = &[
+        ENHANCE_COMMIT_SEED,
+        owner_key.as_ref(),
+        &nonce_bytes,
+        &[commit_bump],
+    ];
+
+    // Return the escrowed item to the owner, then close the item escrow ATA
+    // (rent → owner). The commit PDA signs both CPIs.
+    transfer_checked(
+        CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            TransferChecked {
+                from: ctx.accounts.item_escrow.to_account_info(),
+                mint: ctx.accounts.item_mint.to_account_info(),
+                to: ctx.accounts.owner_item_account.to_account_info(),
+                authority: ctx.accounts.enhance_commit.to_account_info(),
+            },
+            &[commit_signer],
+        ),
+        1,
+        0,
+    )?;
+    close_account(CpiContext::new_with_signer(
+        ctx.accounts.token_program.to_account_info(),
+        CloseAccount {
+            account: ctx.accounts.item_escrow.to_account_info(),
+            destination: ctx.accounts.owner.to_account_info(),
+            authority: ctx.accounts.enhance_commit.to_account_info(),
+        },
+        &[commit_signer],
+    ))?;
+
+    // Burn the forfeited scroll from escrow. The token-account/metadata/
+    // edition refunds credit the commit PDA, whose `close = owner` forwards
+    // every lamport to the owner.
+    burn_nft(
+        CpiContext::new_with_signer(
+            ctx.accounts.token_metadata_program.to_account_info(),
+            BurnNft {
+                metadata: ctx.accounts.scroll_metadata.to_account_info(),
+                owner: ctx.accounts.enhance_commit.to_account_info(),
+                mint: ctx.accounts.scroll_mint.to_account_info(),
+                token: ctx.accounts.scroll_escrow.to_account_info(),
+                edition: ctx.accounts.scroll_master_edition.to_account_info(),
+                spl_token: ctx.accounts.token_program.to_account_info(),
+            },
+            &[commit_signer],
+        ),
+        None,
+    )?;
+
+    // Release the item lock so the owner can commit again (with a NEW scroll).
+    ctx.accounts.enhancement.pending = false;
+
+    // `EnhanceCommit` + `EnhanceScrollMarker` close via their `close = owner`
+    // constraints; the closer never captures value.
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Player avatar: character customization + on-chain equip.
 // ---------------------------------------------------------------------------
 
@@ -1265,5 +1750,34 @@ mod registry_security_tests {
             7 + COMMIT_REVEAL_WINDOW_SLOTS
         );
         assert!(commit_expires_after(u64::MAX).is_err());
+    }
+
+    #[test]
+    fn enhance_success_table_matches_the_spec_ladder() {
+        // KEEP THE TABLE IN ONE CONST (enhancement spec) — this pins it.
+        assert_eq!(
+            SUCCESS_BPS,
+            [1000, 1000, 1000, 700, 500, 350, 250, 175, 120, 80]
+        );
+        assert_eq!(SUCCESS_BPS.len(), MAX_ENHANCE_LEVEL as usize);
+        // +1..+3 are the safe zone; from +4 every attempt can fail.
+        for &per_mille in SUCCESS_BPS.iter().take(3) {
+            assert_eq!(per_mille, 1000);
+        }
+        for &per_mille in SUCCESS_BPS.iter().skip(3) {
+            assert!(per_mille < 1000);
+        }
+    }
+
+    #[test]
+    fn enhance_commit_is_rejected_at_the_level_cap() {
+        // Reaching +10 honestly in E2E is a ~5e-5 event per item (every risky
+        // failure burns it), so the cap guard is pinned at the unit level: the
+        // exact check `commit_enhance` runs before accepting a scroll.
+        for level in 0..MAX_ENHANCE_LEVEL {
+            assert!(require_enhance_committable(level).is_ok());
+        }
+        assert!(require_enhance_committable(MAX_ENHANCE_LEVEL).is_err());
+        assert!(require_enhance_committable(u8::MAX).is_err());
     }
 }

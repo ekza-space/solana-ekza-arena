@@ -9,6 +9,8 @@ import {
   getMint,
   createAssociatedTokenAccountInstruction,
   createTransferInstruction,
+  createMint,
+  mintTo,
 } from "@solana/spl-token";
 import { SolanaEkzaArena } from "../target/types/solana_ekza_arena";
 import stellarIdl from "../../solana-stellar/target/idl/solana_stellar.json";
@@ -2070,6 +2072,852 @@ describe("solana-ekza-arena", () => {
         }
         console.log("E2E_PROOF equipment_v2_unequip=true");
       });
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Item enhancement («заточка», docs/enhancement-design.md): scroll NFTs +
+  // commit-reveal upgrade rolls off SlotHashes.
+  // -------------------------------------------------------------------------
+
+  describe("item enhancement", () => {
+    // Mirror of the program's one-const SUCCESS_BPS table (per-mille).
+    const SUCCESS_BPS = [1000, 1000, 1000, 700, 500, 350, 250, 175, 120, 80];
+    const SCROLL_FEE_MULTIPLIER = 2;
+
+    const enhancementPda = (itemMint: anchor.web3.PublicKey) =>
+      anchor.web3.PublicKey.findProgramAddressSync(
+        [Buffer.from("enhancement"), itemMint.toBuffer()],
+        program.programId
+      )[0];
+
+    const scrollMarkerPda = (scrollMint: anchor.web3.PublicKey) =>
+      anchor.web3.PublicKey.findProgramAddressSync(
+        [Buffer.from("scroll"), scrollMint.toBuffer()],
+        program.programId
+      )[0];
+
+    const enhanceCommitPda = (owner: anchor.web3.PublicKey, nonce: number) =>
+      anchor.web3.PublicKey.findProgramAddressSync(
+        [Buffer.from("enhance_commit"), owner.toBuffer(), u64Bytes(nonce)],
+        program.programId
+      )[0];
+
+    // Escrow ATAs are owned by the commit PDA (off-curve owner).
+    const scrollEscrowAta = (
+      scrollMint: anchor.web3.PublicKey,
+      commit: anchor.web3.PublicKey
+    ) => getAssociatedTokenAddressSync(scrollMint, commit, true);
+    const itemEscrowAta = (
+      itemMint: anchor.web3.PublicKey,
+      commit: anchor.web3.PublicKey
+    ) => getAssociatedTokenAddressSync(itemMint, commit, true);
+
+    // The provider wallet's (usually uninitialized) avatar + equipment PDAs —
+    // commit_enhance requires them for the equipped-item guard.
+    const providerAvatarPda = () =>
+      anchor.web3.PublicKey.findProgramAddressSync(
+        [
+          Buffer.from("player_avatar_v1"),
+          provider.wallet.publicKey.toBuffer(),
+        ],
+        program.programId
+      )[0];
+    const providerEquipmentPda = () =>
+      anchor.web3.PublicKey.findProgramAddressSync(
+        [Buffer.from("equipment"), providerAvatarPda().toBuffer()],
+        program.programId
+      )[0];
+
+    // ---- Client-side re-derivation of the program's roll (splitmix64) ----
+    const MASK64 = (1n << 64n) - 1n;
+    const splitmix64Mix = (x: bigint): bigint => {
+      let z = (x + 0x9e3779b97f4a7c15n) & MASK64;
+      z = ((z ^ (z >> 30n)) * 0xbf58476d1ce4e5b9n) & MASK64;
+      z = ((z ^ (z >> 27n)) * 0x94d049bb133111ebn) & MASK64;
+      return (z ^ (z >> 31n)) & MASK64;
+    };
+
+    // First 8 LE bytes of the SlotHashes entry for `slot` (fixed once
+    // written — the exact bytes reveal_enhance reads on-chain).
+    const slotHashFirst8 = async (slot: number): Promise<bigint> => {
+      const info = await provider.connection.getAccountInfo(
+        SLOT_HASHES_SYSVAR
+      );
+      const data = info!.data;
+      const len = Number(data.readBigUInt64LE(0));
+      for (let i = 0; i < len; i++) {
+        const base = 8 + i * 40;
+        if (Number(data.readBigUInt64LE(base)) === slot) {
+          return data.readBigUInt64LE(base + 8);
+        }
+      }
+      throw new Error(`slot hash for ${slot} aged out of the sysvar`);
+    };
+
+    const expectedEnhanceSuccess = async (
+      targetSlot: number,
+      owner: anchor.web3.PublicKey,
+      itemMint: anchor.web3.PublicKey,
+      nonce: number,
+      level: number
+    ): Promise<boolean> => {
+      const hash = await slotHashFirst8(targetSlot);
+      const ownerFirst8 = owner.toBuffer().readBigUInt64LE(0);
+      const mintFirst8 = itemMint.toBuffer().readBigUInt64LE(0);
+      const seed = splitmix64Mix(
+        hash ^ ownerFirst8 ^ mintFirst8 ^ BigInt(nonce)
+      );
+      return seed % 1000n < BigInt(SUCCESS_BPS[level]);
+    };
+
+    // ---- Instruction wrappers ----
+    const mintScroll = async () => {
+      const scrollMint = anchor.web3.Keypair.generate();
+      const buyer = provider.wallet.publicKey;
+      const scrollAta = getAssociatedTokenAddressSync(
+        scrollMint.publicKey,
+        buyer
+      );
+      await program.methods
+        .mintEnhanceScroll({
+          name: "Ekza Enhance Scroll",
+          uri: "https://meta.ekza.space/arena/scroll.json",
+        })
+        .accountsStrict({
+          registry: registryPda(),
+          scrollMint: scrollMint.publicKey,
+          scrollMarker: scrollMarkerPda(scrollMint.publicKey),
+          buyerTokenAccount: scrollAta,
+          buyer,
+          treasury: treasury.publicKey,
+          sink: sink.publicKey,
+          metadataAccount: metadataPda(scrollMint.publicKey),
+          masterEdition: masterEditionPda(scrollMint.publicKey),
+          tokenMetadataProgram: TOKEN_METADATA_PROGRAM_ID,
+          tokenProgram: TOKEN_PROGRAM_ID,
+          associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+          systemProgram: anchor.web3.SystemProgram.programId,
+          rent: anchor.web3.SYSVAR_RENT_PUBKEY,
+        })
+        .preInstructions([
+          anchor.web3.ComputeBudgetProgram.setComputeUnitLimit({
+            units: 400_000,
+          }),
+        ])
+        .signers([scrollMint])
+        .rpc();
+      return { scrollMint: scrollMint.publicKey, scrollAta };
+    };
+
+    const commitEnhance = (
+      itemMint: anchor.web3.PublicKey,
+      scroll: { scrollMint: anchor.web3.PublicKey; scrollAta: anchor.web3.PublicKey },
+      nonce: number
+    ) => {
+      const owner = provider.wallet.publicKey;
+      const commit = enhanceCommitPda(owner, nonce);
+      return program.methods
+        .commitEnhance(new anchor.BN(nonce))
+        .accountsStrict({
+          itemMint,
+          arenaItem: arenaItemPda(itemMint),
+          itemTokenAccount: getAssociatedTokenAddressSync(itemMint, owner),
+          itemEscrow: itemEscrowAta(itemMint, commit),
+          playerAvatar: providerAvatarPda(),
+          equipmentRecord: providerEquipmentPda(),
+          enhancement: enhancementPda(itemMint),
+          scrollMint: scroll.scrollMint,
+          scrollMarker: scrollMarkerPda(scroll.scrollMint),
+          scrollTokenAccount: scroll.scrollAta,
+          enhanceCommit: commit,
+          scrollEscrow: scrollEscrowAta(scroll.scrollMint, commit),
+          owner,
+          tokenProgram: TOKEN_PROGRAM_ID,
+          associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+          systemProgram: anchor.web3.SystemProgram.programId,
+        })
+        .rpc();
+    };
+
+    // Build the (v1.1 permissionless) reveal instruction. `caller` defaults
+    // to the provider wallet; pass a stranger to prove permissionlessness.
+    const revealEnhanceIx = (
+      itemMint: anchor.web3.PublicKey,
+      scrollMint: anchor.web3.PublicKey,
+      nonce: number,
+      caller: anchor.web3.PublicKey
+    ) => {
+      const owner = provider.wallet.publicKey;
+      const commit = enhanceCommitPda(owner, nonce);
+      return program.methods
+        .revealEnhance(new anchor.BN(nonce))
+        .accountsStrict({
+          enhanceCommit: commit,
+          itemMint,
+          arenaItem: arenaItemPda(itemMint),
+          enhancement: enhancementPda(itemMint),
+          itemTokenAccount: getAssociatedTokenAddressSync(itemMint, owner),
+          itemEscrow: itemEscrowAta(itemMint, commit),
+          itemMetadata: metadataPda(itemMint),
+          itemMasterEdition: masterEditionPda(itemMint),
+          scrollMint,
+          scrollMarker: scrollMarkerPda(scrollMint),
+          scrollEscrow: scrollEscrowAta(scrollMint, commit),
+          scrollMetadata: metadataPda(scrollMint),
+          scrollMasterEdition: masterEditionPda(scrollMint),
+          owner,
+          caller,
+          slotHashes: SLOT_HASHES_SYSVAR,
+          tokenMetadataProgram: TOKEN_METADATA_PROGRAM_ID,
+          tokenProgram: TOKEN_PROGRAM_ID,
+          associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+          systemProgram: anchor.web3.SystemProgram.programId,
+        });
+    };
+
+    const revealEnhance = (
+      itemMint: anchor.web3.PublicKey,
+      scrollMint: anchor.web3.PublicKey,
+      nonce: number
+    ) =>
+      revealEnhanceIx(itemMint, scrollMint, nonce, provider.wallet.publicKey)
+        .preInstructions([
+          anchor.web3.ComputeBudgetProgram.setComputeUnitLimit({
+            units: 400_000,
+          }),
+        ])
+        .rpc();
+
+    // One full attempt: buy a scroll, commit, wait past the target slot,
+    // re-derive the program's roll from the SAME SlotHashes entry, reveal,
+    // and assert the on-chain outcome agrees exactly.
+    const enhanceOnce = async (itemMint: anchor.web3.PublicKey) => {
+      const owner = provider.wallet.publicKey;
+      const scroll = await mintScroll();
+      const nonce = nextCommitNonce++;
+      const commit = enhanceCommitPda(owner, nonce);
+
+      const levelBefore = (
+        await program.account.itemEnhancement.fetchNullable(
+          enhancementPda(itemMint)
+        )
+      )?.level ?? 0;
+
+      await commitEnhance(itemMint, scroll, nonce);
+      const pending = await program.account.enhanceCommit.fetch(commit);
+      await waitForSlotAfter(pending.targetSlot.toNumber());
+
+      const expectSuccess = await expectedEnhanceSuccess(
+        pending.targetSlot.toNumber(),
+        owner,
+        itemMint,
+        nonce,
+        levelBefore
+      );
+
+      const ownerBefore = await provider.connection.getBalance(owner);
+      await revealEnhance(itemMint, scroll.scrollMint, nonce);
+
+      // Scroll consumed regardless of outcome: supply 0, escrow + marker +
+      // commit all gone.
+      const scrollSupply = await getMint(
+        provider.connection,
+        scroll.scrollMint
+      );
+      expect(scrollSupply.supply.toString()).to.equal("0");
+      expect(
+        await provider.connection.getAccountInfo(
+          scrollEscrowAta(scroll.scrollMint, commit)
+        )
+      ).to.equal(null);
+      expect(
+        await provider.connection.getAccountInfo(
+          scrollMarkerPda(scroll.scrollMint)
+        )
+      ).to.equal(null);
+      expect(await provider.connection.getAccountInfo(commit)).to.equal(null);
+
+      // Item escrow resolved either way: returned on success, burned by
+      // `BurnNft` on failure — the escrow ATA never survives a reveal.
+      expect(
+        await provider.connection.getAccountInfo(
+          itemEscrowAta(itemMint, commit)
+        )
+      ).to.equal(null);
+
+      const enhancement = await program.account.itemEnhancement.fetchNullable(
+        enhancementPda(itemMint)
+      );
+      if (expectSuccess) {
+        // Derived success: level bumped (both accounts), item back with the
+        // owner.
+        expect(enhancement).to.not.equal(null);
+        expect(enhancement!.level).to.equal(levelBefore + 1);
+        expect(enhancement!.pending).to.equal(false);
+        const item = await program.account.arenaItem.fetch(
+          arenaItemPda(itemMint)
+        );
+        expect(item.enhanceLevel).to.equal(levelBefore + 1); // mirror
+        expect(
+          (
+            await getAccount(
+              provider.connection,
+              getAssociatedTokenAddressSync(itemMint, owner)
+            )
+          ).amount.toString()
+        ).to.equal("1");
+      } else {
+        // Derived failure: item NFT burned from escrow (full Metaplex
+        // teardown), ArenaItem + ItemEnhancement closed, and the rent
+        // reclaimed to the OWNER — the balance delta beats the tx fee.
+        expect(enhancement).to.equal(null);
+        expect(
+          await provider.connection.getAccountInfo(arenaItemPda(itemMint))
+        ).to.equal(null);
+        const burnedMint = await getMint(provider.connection, itemMint);
+        expect(burnedMint.supply.toString()).to.equal("0");
+        expect(
+          await provider.connection.getAccountInfo(masterEditionPda(itemMint))
+        ).to.equal(null);
+        const ownerAfter = await provider.connection.getBalance(owner);
+        expect(ownerAfter).to.be.greaterThan(ownerBefore);
+      }
+      return { success: expectSuccess, levelBefore };
+    };
+
+    it("mints an enhancement scroll for 2x the commit fee with the commit_mint treasury/sink split (to the lamport)", async () => {
+      const registry = await program.account.arenaRegistry.fetch(registryPda());
+      const fee = registry.commitFeeLamports.toNumber() * SCROLL_FEE_MULTIPLIER;
+      const sinkFee = Math.floor((fee * registry.sinkBps) / 10_000);
+      const platformFee = fee - sinkFee; // creator folds into platform
+
+      const treasuryBefore = await provider.connection.getBalance(
+        treasury.publicKey
+      );
+      const sinkBefore = await provider.connection.getBalance(sink.publicKey);
+
+      const scroll = await mintScroll();
+
+      const treasuryAfter = await provider.connection.getBalance(
+        treasury.publicKey
+      );
+      const sinkAfter = await provider.connection.getBalance(sink.publicKey);
+      expect(treasuryAfter - treasuryBefore).to.equal(platformFee);
+      expect(sinkAfter - sinkBefore).to.equal(sinkFee);
+
+      // Real 1-of-1 NFT: supply 1, decimals 0, EKZASCROLL metadata symbol.
+      const mintInfo = await getMint(provider.connection, scroll.scrollMint);
+      expect(mintInfo.supply.toString()).to.equal("1");
+      expect(mintInfo.decimals).to.equal(0);
+      const ataInfo = await getAccount(provider.connection, scroll.scrollAta);
+      expect(ataInfo.amount.toString()).to.equal("1");
+      const metaInfo = await provider.connection.getAccountInfo(
+        metadataPda(scroll.scrollMint)
+      );
+      expect(metaInfo!.data.toString("utf8")).to.include("EKZASCROLL");
+
+      // Proof-of-purchase marker PDA issued.
+      const marker = await program.account.enhanceScrollMarker.fetch(
+        scrollMarkerPda(scroll.scrollMint)
+      );
+      expect(marker.scrollMint.equals(scroll.scrollMint)).to.equal(true);
+
+      console.log("E2E_PROOF scroll_mint=" + scroll.scrollMint.toBase58());
+      console.log("E2E_PROOF scroll_fee_lamports=" + fee);
+
+      // Consume it on a fresh item so no scroll leaks into later tests.
+      const { mint } = await mintArenaItemNft({
+        baseType: { weapon: {} },
+        skin: { builtin: [1] },
+        name: "Scroll Fee Target",
+      });
+      const { success } = await enhanceOnce(mint);
+      expect(success).to.equal(true); // level 0 -> 1 is the safe zone
+    });
+
+    it("safe zone: +1..+3 always succeed, each consuming one scroll", async () => {
+      const { mint } = await mintArenaItemNft({
+        baseType: { weapon: {} },
+        skin: { builtin: [2] },
+        name: "Safe Zone Sword",
+      });
+
+      for (let level = 0; level < 3; level++) {
+        const { success, levelBefore } = await enhanceOnce(mint);
+        expect(levelBefore).to.equal(level);
+        expect(success).to.equal(true); // SUCCESS_BPS[0..3] = 1000‰
+      }
+
+      const enhancement = await program.account.itemEnhancement.fetch(
+        enhancementPda(mint)
+      );
+      expect(enhancement.level).to.equal(3);
+      expect(enhancement.attempts).to.equal(3);
+      expect(enhancement.pending).to.equal(false);
+      expect(enhancement.itemMint.equals(mint)).to.equal(true);
+      console.log("E2E_PROOF enhance_safe_zone_plus3=" + mint.toBase58());
+    });
+
+    it("rejects a double-commit for the same item while one is pending", async () => {
+      const { mint } = await mintArenaItemNft({
+        baseType: { head: {} },
+        skin: { builtin: [3] },
+        name: "Double Commit Helm",
+      });
+      const scrollA = await mintScroll();
+      const scrollB = await mintScroll();
+      const nonceA = nextCommitNonce++;
+      await commitEnhance(mint, scrollA, nonceA);
+
+      try {
+        await commitEnhance(mint, scrollB, nextCommitNonce++);
+        expect.fail("a second commit for a pending item must be rejected");
+      } catch (error) {
+        // v1.2 escrows the item token at commit, so the second commit fails
+        // at the item_token account constraint (the ATA is now empty) before
+        // reaching the `already pending` guard — either layer is a valid
+        // rejection; the item is provably locked while one attempt is open.
+        const msg = String(error);
+        expect(
+          msg.includes("already pending") || msg.includes("item_token")
+        ).to.equal(true);
+      }
+
+      // The first commit still reveals fine (level 0 => safe success).
+      const pending = await program.account.enhanceCommit.fetch(
+        enhanceCommitPda(provider.wallet.publicKey, nonceA)
+      );
+      await waitForSlotAfter(pending.targetSlot.toNumber());
+      await revealEnhance(mint, scrollA.scrollMint, nonceA);
+      const enhancement = await program.account.itemEnhancement.fetch(
+        enhancementPda(mint)
+      );
+      expect(enhancement.level).to.equal(1);
+      expect(enhancement.pending).to.equal(false);
+      console.log("E2E_PROOF enhance_double_commit_rejected=true");
+    });
+
+    it("rejects reveal without a commit", async () => {
+      const { mint } = await mintArenaItemNft({
+        baseType: { charm: {} },
+        skin: { builtin: [4] },
+        name: "No Commit Charm",
+      });
+      const scroll = await mintScroll();
+      try {
+        await revealEnhance(mint, scroll.scrollMint, nextCommitNonce++);
+        expect.fail("reveal without a commit must be rejected");
+      } catch (error) {
+        expect(String(error)).to.include("AccountNotInitialized");
+      }
+    });
+
+    it("rejects committing a foreign NFT as a scroll (no marker PDA)", async () => {
+      const { mint } = await mintArenaItemNft({
+        baseType: { armor: {} },
+        skin: { builtin: [5] },
+        name: "Foreign Scroll Armor",
+      });
+
+      // A self-minted supply-1 SPL token — an NFT-shaped fake with no
+      // protocol marker (never paid the scroll fee).
+      const payer = (provider.wallet as anchor.Wallet).payer;
+      const fakeScrollMint = await createMint(
+        provider.connection,
+        payer,
+        provider.wallet.publicKey,
+        null,
+        0
+      );
+      const fakeAta = getAssociatedTokenAddressSync(
+        fakeScrollMint,
+        provider.wallet.publicKey
+      );
+      await provider.sendAndConfirm(
+        new anchor.web3.Transaction().add(
+          createAssociatedTokenAccountInstruction(
+            provider.wallet.publicKey,
+            fakeAta,
+            provider.wallet.publicKey,
+            fakeScrollMint
+          )
+        )
+      );
+      await mintTo(
+        provider.connection,
+        payer,
+        fakeScrollMint,
+        fakeAta,
+        payer,
+        1
+      );
+
+      try {
+        await commitEnhance(
+          mint,
+          { scrollMint: fakeScrollMint, scrollAta: fakeAta },
+          nextCommitNonce++
+        );
+        expect.fail("a foreign NFT without a marker PDA must be rejected");
+      } catch (error) {
+        expect(String(error)).to.include("AccountNotInitialized");
+      }
+      console.log("E2E_PROOF enhance_foreign_scroll_rejected=true");
+    });
+
+    it("expired commit: permissionless close BURNS the scroll (no refund) and unlocks the item", async () => {
+      const owner = provider.wallet.publicKey;
+      const { mint } = await mintArenaItemNft({
+        baseType: { weapon: {} },
+        skin: { builtin: [6] },
+        name: "Expiry Blade",
+      });
+      const scroll = await mintScroll();
+      const nonce = nextCommitNonce++;
+      const commit = enhanceCommitPda(owner, nonce);
+      await commitEnhance(mint, scroll, nonce);
+
+      // Scroll escrowed: the owner's ATA is empty while the commit is open.
+      expect(
+        (await getAccount(provider.connection, scroll.scrollAta)).amount.toString()
+      ).to.equal("0");
+
+      const closer = anchor.web3.Keypair.generate();
+      const airdrop = await provider.connection.requestAirdrop(
+        closer.publicKey,
+        anchor.web3.LAMPORTS_PER_SOL
+      );
+      await provider.connection.confirmTransaction(airdrop, "confirmed");
+
+      const closeExpired = () =>
+        program.methods
+          .closeExpiredEnhanceCommit(new anchor.BN(nonce))
+          .accountsStrict({
+            enhanceCommit: commit,
+            owner,
+            enhancement: enhancementPda(mint),
+            itemMint: mint,
+            itemEscrow: itemEscrowAta(mint, commit),
+            ownerItemAccount: getAssociatedTokenAddressSync(mint, owner),
+            scrollMint: scroll.scrollMint,
+            scrollMarker: scrollMarkerPda(scroll.scrollMint),
+            scrollEscrow: scrollEscrowAta(scroll.scrollMint, commit),
+            scrollMetadata: metadataPda(scroll.scrollMint),
+            scrollMasterEdition: masterEditionPda(scroll.scrollMint),
+            closer: closer.publicKey,
+            tokenMetadataProgram: TOKEN_METADATA_PROGRAM_ID,
+            tokenProgram: TOKEN_PROGRAM_ID,
+            associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+            systemProgram: anchor.web3.SystemProgram.programId,
+          })
+          .signers([closer])
+          .rpc();
+
+      // A live commitment must not be closable.
+      try {
+        await closeExpired();
+        expect.fail("a live enhancement commitment must not be closable");
+      } catch (error) {
+        expect(String(error)).to.include("has not expired yet");
+      }
+
+      const pending = await program.account.enhanceCommit.fetch(commit);
+      await waitForSlotAfter(
+        pending.targetSlot.toNumber() + COMMIT_REVEAL_WINDOW_SLOTS
+      );
+      await closeExpired();
+
+      // v1.1: the scroll is FORFEIT — burned, never refunded. Escrow, marker
+      // and commit are gone; the owner's old scroll ATA stays empty.
+      const burnedScroll = await getMint(
+        provider.connection,
+        scroll.scrollMint
+      );
+      expect(burnedScroll.supply.toString()).to.equal("0");
+      expect(
+        (await getAccount(provider.connection, scroll.scrollAta)).amount.toString()
+      ).to.equal("0");
+      expect(
+        await provider.connection.getAccountInfo(
+          scrollEscrowAta(scroll.scrollMint, commit)
+        )
+      ).to.equal(null);
+      expect(
+        await provider.connection.getAccountInfo(
+          scrollMarkerPda(scroll.scrollMint)
+        )
+      ).to.equal(null);
+      expect(await provider.connection.getAccountInfo(commit)).to.equal(null);
+
+      // The item survived: back in the owner's ATA (escrow closed), stats
+      // PDA intact, and unlocked again.
+      expect(
+        (
+          await getAccount(
+            provider.connection,
+            getAssociatedTokenAddressSync(mint, owner)
+          )
+        ).amount.toString()
+      ).to.equal("1");
+      expect(
+        await provider.connection.getAccountInfo(itemEscrowAta(mint, commit))
+      ).to.equal(null);
+      const enhancement = await program.account.itemEnhancement.fetch(
+        enhancementPda(mint)
+      );
+      expect(enhancement.pending).to.equal(false);
+      expect(enhancement.level).to.equal(0); // nothing rolled
+      expect(
+        await provider.connection.getAccountInfo(arenaItemPda(mint))
+      ).to.not.equal(null);
+
+      // The unlocked item can commit again — with a NEW scroll (the old one
+      // is ash) — and reveal normally.
+      const { success } = await enhanceOnce(mint);
+      expect(success).to.equal(true); // level 0 -> 1, safe zone
+      console.log("E2E_PROOF enhance_expired_commit_scroll_burned=true");
+    });
+
+    it("permissionless reveal: a different wallet reveals the owner's pending commit and the outcome lands on the owner's item", async () => {
+      const owner = provider.wallet.publicKey;
+      const { mint } = await mintArenaItemNft({
+        baseType: { charm: {} },
+        skin: { builtin: [8] },
+        name: "Keeper Bait Charm",
+      });
+      const scroll = await mintScroll();
+      const nonce = nextCommitNonce++;
+      const commit = enhanceCommitPda(owner, nonce);
+      await commitEnhance(mint, scroll, nonce);
+
+      const pending = await program.account.enhanceCommit.fetch(commit);
+      await waitForSlotAfter(pending.targetSlot.toNumber());
+
+      // A stranger (keeper/rival) builds and pays for the reveal itself —
+      // the owner does NOT sign this transaction at all.
+      const stranger = anchor.web3.Keypair.generate();
+      const airdrop = await provider.connection.requestAirdrop(
+        stranger.publicKey,
+        anchor.web3.LAMPORTS_PER_SOL
+      );
+      await provider.connection.confirmTransaction(airdrop, "confirmed");
+
+      const ownerBefore = await provider.connection.getBalance(owner);
+      const ix = await revealEnhanceIx(
+        mint,
+        scroll.scrollMint,
+        nonce,
+        stranger.publicKey
+      ).instruction();
+      const tx = new anchor.web3.Transaction()
+        .add(
+          anchor.web3.ComputeBudgetProgram.setComputeUnitLimit({
+            units: 400_000,
+          })
+        )
+        .add(ix);
+      tx.feePayer = stranger.publicKey;
+      await anchor.web3.sendAndConfirmTransaction(provider.connection, tx, [
+        stranger,
+      ]);
+
+      // Outcome applied to the OWNER's item (level 0 => guaranteed success).
+      const enhancement = await program.account.itemEnhancement.fetch(
+        enhancementPda(mint)
+      );
+      expect(enhancement.level).to.equal(1);
+      expect(enhancement.pending).to.equal(false);
+      // The owner still holds the item NFT.
+      expect(
+        (
+          await getAccount(
+            provider.connection,
+            getAssociatedTokenAddressSync(mint, owner)
+          )
+        ).amount.toString()
+      ).to.equal("1");
+      // Rent refunds went to the owner, not the revealing stranger.
+      const ownerAfter = await provider.connection.getBalance(owner);
+      expect(ownerAfter).to.be.greaterThan(ownerBefore);
+      expect(await provider.connection.getAccountInfo(commit)).to.equal(null);
+      console.log("E2E_PROOF enhance_permissionless_reveal_by_stranger=true");
+    });
+
+    it("item escrow: the owner cannot move the item after commit (front-run defense)", async () => {
+      const owner = provider.wallet.publicKey;
+      const { mint, ata } = await mintArenaItemNft({
+        baseType: { weapon: {} },
+        skin: { builtin: [9] },
+        name: "Escrowed Blade",
+      });
+      const scroll = await mintScroll();
+      const nonce = nextCommitNonce++;
+      const commit = enhanceCommitPda(owner, nonce);
+      await commitEnhance(mint, scroll, nonce);
+
+      // The token left the owner's ATA at commit — it sits in the commit
+      // PDA's escrow, out of reach of any revoke/transfer front-run.
+      expect(
+        (await getAccount(provider.connection, ata)).amount.toString()
+      ).to.equal("0");
+      expect(
+        (
+          await getAccount(provider.connection, itemEscrowAta(mint, commit))
+        ).amount.toString()
+      ).to.equal("1");
+
+      // An attempted transfer to another wallet fails: nothing to move.
+      const rival = anchor.web3.Keypair.generate();
+      const rivalAta = getAssociatedTokenAddressSync(mint, rival.publicKey);
+      try {
+        await provider.sendAndConfirm(
+          new anchor.web3.Transaction()
+            .add(
+              createAssociatedTokenAccountInstruction(
+                owner,
+                rivalAta,
+                rival.publicKey,
+                mint
+              )
+            )
+            .add(createTransferInstruction(ata, rivalAta, owner, 1))
+        );
+        expect.fail("the owner must not be able to move an escrowed item");
+      } catch (error) {
+        expect(String(error)).to.include("insufficient funds");
+      }
+
+      // Reveal proceeds normally (level 0 => safe success) and returns it.
+      const pending = await program.account.enhanceCommit.fetch(commit);
+      await waitForSlotAfter(pending.targetSlot.toNumber());
+      await revealEnhance(mint, scroll.scrollMint, nonce);
+      expect(
+        (await getAccount(provider.connection, ata)).amount.toString()
+      ).to.equal("1");
+      console.log("E2E_PROOF enhance_item_escrow_locked=true");
+    });
+
+    it("rejects committing an item that is currently equipped", async () => {
+      const owner = provider.wallet.publicKey;
+
+      // Give the PROVIDER wallet an avatar (weapon+head card) and equip a
+      // fresh weapon into it via the legacy path.
+      const cardIndex = await nextArenaAssetIndex();
+      const avatarCard = arenaAssetPda(cardIndex);
+      await program.methods
+        .registerArenaAsset({ ...baseArgs(), archetypeId: "enhance_guard" })
+        .accountsStrict({
+          registry: registryPda(),
+          arenaAsset: avatarCard,
+          payer: owner,
+          systemProgram: anchor.web3.SystemProgram.programId,
+        })
+        .rpc();
+      await program.methods
+        .createPlayerAvatar({ name: "Enhance Guard" })
+        .accountsStrict({
+          playerAvatar: providerAvatarPda(),
+          avatarAsset: avatarCard,
+          owner,
+          systemProgram: anchor.web3.SystemProgram.programId,
+        })
+        .rpc();
+
+      const { mint, ata } = await mintArenaItemNft({
+        baseType: { weapon: {} },
+        skin: { builtin: [10] },
+        name: "Equipped Blade",
+      });
+      await program.methods
+        .equipItem()
+        .accountsStrict({
+          playerAvatar: providerAvatarPda(),
+          arenaItem: arenaItemPda(mint),
+          mint,
+          tokenAccount: ata,
+          owner,
+        })
+        .rpc();
+
+      // Equipped item => commit_enhance rejected.
+      const scroll = await mintScroll();
+      try {
+        await commitEnhance(mint, scroll, nextCommitNonce++);
+        expect.fail("an equipped item must not be committable");
+      } catch (error) {
+        expect(String(error)).to.include("currently equipped");
+      }
+
+      // After unequipping, the same item + scroll commit fine.
+      await program.methods
+        .unequipItem(0)
+        .accountsStrict({ playerAvatar: providerAvatarPda(), owner })
+        .rpc();
+      const nonce = nextCommitNonce++;
+      await commitEnhance(mint, scroll, nonce);
+      const pending = await program.account.enhanceCommit.fetch(
+        enhanceCommitPda(owner, nonce)
+      );
+      await waitForSlotAfter(pending.targetSlot.toNumber());
+      await revealEnhance(mint, scroll.scrollMint, nonce);
+      expect(
+        (await program.account.itemEnhancement.fetch(enhancementPda(mint)))
+          .level
+      ).to.equal(1);
+      console.log("E2E_PROOF enhance_equipped_guard=true");
+    });
+
+    it("risky zone (+4 and up): outcome always matches the slot-hash derivation; failure burns the item and closes its PDAs", async () => {
+      // enhanceOnce derives the roll client-side from the SAME SlotHashes
+      // entry the program reads and asserts exact agreement on EVERY attempt.
+      // Loop items until both risky outcomes have been observed (each item is
+      // pumped through the safe zone to +3 first). P(miss) shrinks
+      // geometrically; the guard bounds the worst case.
+      const outcomes = { success: false, failure: false };
+      let itemsUsed = 0;
+      while ((!outcomes.success || !outcomes.failure) && itemsUsed < 8) {
+        itemsUsed++;
+        const { mint } = await mintArenaItemNft({
+          baseType: { weapon: {} },
+          skin: { builtin: [7] },
+          name: `Risky Blade ${itemsUsed}`,
+        });
+        // Safe zone first: 0 -> 3.
+        for (let i = 0; i < 3; i++) {
+          const { success } = await enhanceOnce(mint);
+          expect(success).to.equal(true);
+        }
+        // Risky attempts until the item breaks (or hits the cap).
+        let alive = true;
+        let level = 3;
+        while (
+          alive &&
+          level < 10 &&
+          (!outcomes.success || !outcomes.failure)
+        ) {
+          const { success, levelBefore } = await enhanceOnce(mint);
+          expect(levelBefore).to.equal(level);
+          if (success) {
+            outcomes.success = true;
+            level++;
+          } else {
+            outcomes.failure = true;
+            alive = false;
+          }
+        }
+        if (alive && level >= 4) {
+          // Item survived with a risky success — proof it kept its stats PDA.
+          expect(
+            await provider.connection.getAccountInfo(arenaItemPda(mint))
+          ).to.not.equal(null);
+        }
+      }
+      expect(outcomes.success).to.equal(true);
+      expect(outcomes.failure).to.equal(true);
+      console.log(
+        "E2E_PROOF enhance_risky_both_outcomes items_used=" + itemsUsed
+      );
     });
   });
 });

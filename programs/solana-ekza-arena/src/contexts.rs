@@ -7,14 +7,16 @@ use anchor_spl::{
 
 use crate::{
     constants::{
-        ARENA_ASSET_SEED, ARENA_ITEM_SEED, EQUIPMENT_SEED, MINT_COMMIT_SEED, PLAYER_AVATAR_SEED,
-        REGISTRY_SEED, STELLAR_LINK_SEED, STELLAR_RELEASE_LINK_SEED,
+        ARENA_ASSET_SEED, ARENA_ITEM_SEED, ENHANCEMENT_SEED, ENHANCE_COMMIT_SEED, EQUIPMENT_SEED,
+        MINT_COMMIT_SEED, PLAYER_AVATAR_SEED, REGISTRY_SEED, SCROLL_SEED, STELLAR_LINK_SEED,
+        STELLAR_RELEASE_LINK_SEED,
     },
     error::ArenaRegistryError,
     state::{
         ArenaAssetData, ArenaItem, ArenaRegistry, CommitMintArgs, ConfigureRegistryArgs,
-        CreatePlayerAvatarArgs, CustomizeAvatarArgs, EquipmentRecord, MintArenaItemArgs,
-        MintCommit, PlayerAvatar, RegisterArenaAssetArgs, RegisterArenaAssetFromStellarArgs,
+        CreatePlayerAvatarArgs, CustomizeAvatarArgs, EnhanceCommit, EnhanceScrollMarker,
+        EquipmentRecord, ItemEnhancement, MintArenaItemArgs, MintCommit, MintEnhanceScrollArgs,
+        PlayerAvatar, RegisterArenaAssetArgs, RegisterArenaAssetFromStellarArgs,
         StellarArenaAssetLink, StellarReleaseLink,
     },
 };
@@ -642,6 +644,457 @@ pub struct RevealMint<'info> {
     pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, System>,
     pub rent: Sysvar<'info, Rent>,
+}
+
+// ---------------------------------------------------------------------------
+// Item enhancement («заточка», docs/enhancement-design.md).
+// ---------------------------------------------------------------------------
+
+/// `mint_enhance_scroll`: sell one consumable EnhanceScroll NFT (supply 1,
+/// decimals 0, Master Edition, symbol `EKZASCROLL`) for
+/// `registry.commit_fee_lamports × SCROLL_FEE_MULTIPLIER`, split to the same
+/// treasury/sink destinations as `commit_mint`. The `["scroll", scroll_mint]`
+/// marker PDA is the proof-of-purchase `commit_enhance` requires.
+#[derive(Accounts)]
+#[instruction(args: MintEnhanceScrollArgs)]
+pub struct MintEnhanceScroll<'info> {
+    #[account(
+        mut,
+        seeds = [REGISTRY_SEED],
+        bump
+    )]
+    pub registry: Box<Account<'info, ArenaRegistry>>,
+
+    /// The new scroll NFT mint (1 token, 0 decimals). Mint+freeze authority
+    /// start on the buyer; the Master Edition CPI then takes them over.
+    #[account(
+        init,
+        payer = buyer,
+        mint::decimals = 0,
+        mint::authority = buyer,
+        mint::freeze_authority = buyer
+    )]
+    pub scroll_mint: Box<Account<'info, Mint>>,
+
+    /// Proof-of-purchase marker PDA, seeded by the scroll mint.
+    #[account(
+        init,
+        payer = buyer,
+        space = 8 + EnhanceScrollMarker::INIT_SPACE,
+        seeds = [SCROLL_SEED, scroll_mint.key().as_ref()],
+        bump
+    )]
+    pub scroll_marker: Box<Account<'info, EnhanceScrollMarker>>,
+
+    /// Buyer's associated token account — receives the single scroll token.
+    #[account(
+        init,
+        payer = buyer,
+        associated_token::mint = scroll_mint,
+        associated_token::authority = buyer
+    )]
+    pub buyer_token_account: Box<Account<'info, TokenAccount>>,
+
+    #[account(mut)]
+    pub buyer: Signer<'info>,
+
+    /// CHECK: Receives the platform slice; address checked against registry.
+    #[account(mut)]
+    pub treasury: UncheckedAccount<'info>,
+
+    /// CHECK: Receives the protocol-sink slice; address checked against registry.
+    #[account(mut)]
+    pub sink: UncheckedAccount<'info>,
+
+    /// CHECK: Metaplex metadata account PDA for this mint (created via CPI).
+    #[account(
+        mut,
+        seeds = [b"metadata", token_metadata_program.key().as_ref(), scroll_mint.key().as_ref()],
+        bump,
+        seeds::program = token_metadata_program.key()
+    )]
+    pub metadata_account: UncheckedAccount<'info>,
+
+    /// CHECK: Metaplex master edition PDA for this mint (created via CPI).
+    #[account(
+        mut,
+        seeds = [b"metadata", token_metadata_program.key().as_ref(), scroll_mint.key().as_ref(), b"edition"],
+        bump,
+        seeds::program = token_metadata_program.key()
+    )]
+    pub master_edition: UncheckedAccount<'info>,
+
+    pub token_metadata_program: Program<'info, Metadata>,
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, System>,
+    pub rent: Sysvar<'info, Rent>,
+}
+
+/// `commit_enhance`: lock a FUTURE slot for one upgrade attempt and escrow
+/// BOTH the scroll AND the item into ATAs owned by the commit PDA. The item
+/// escrow (v1.2) is what makes the permissionless failure burn irrevocable —
+/// an SPL delegate could be unilaterally revoked/cleared by the owner to dodge
+/// a peeked loss, but an escrowed token is out of their reach. No roll happens
+/// here — that is `reveal_enhance`'s job, seeded by the then-unknown
+/// `target_slot` hash (same revert-grind-resistant shape as `commit_mint`).
+#[derive(Accounts)]
+#[instruction(nonce: u64)]
+pub struct CommitEnhance<'info> {
+    /// The item NFT mint whose enhancement is being attempted.
+    pub item_mint: Box<Account<'info, Mint>>,
+
+    /// The item's rolled stats PDA — its seeds bind it 1:1 to `item_mint`.
+    #[account(
+        seeds = [ARENA_ITEM_SEED, item_mint.key().as_ref()],
+        bump = arena_item.bump,
+    )]
+    pub arena_item: Box<Account<'info, ArenaItem>>,
+
+    /// Owner's item token account — must hold exactly the 1 NFT token (only
+    /// the current holder may gamble the item); the token moves to the item
+    /// escrow in this instruction.
+    #[account(
+        mut,
+        associated_token::mint = item_mint,
+        associated_token::authority = owner,
+        constraint = item_token_account.amount == 1 @ ArenaRegistryError::NotNftHolder,
+    )]
+    pub item_token_account: Box<Account<'info, TokenAccount>>,
+
+    /// Item escrow — an ATA owned by the commit PDA (v1.2). Hard-locks the
+    /// item: it cannot be traded, re-committed, or shielded from the failure
+    /// burn while the outcome is pending.
+    #[account(
+        init,
+        payer = owner,
+        associated_token::mint = item_mint,
+        associated_token::authority = enhance_commit
+    )]
+    pub item_escrow: Box<Account<'info, TokenAccount>>,
+
+    /// CHECK: The owner's canonical `PlayerAvatar` PDA — address-bound by
+    /// seeds and allowed to be uninitialized (no avatar yet). If it exists,
+    /// the handler rejects committing an item referenced by its legacy
+    /// `equipped` mirror (audit guard: no gambling with equipped gear).
+    #[account(
+        seeds = [PLAYER_AVATAR_SEED, owner.key().as_ref()],
+        bump
+    )]
+    pub player_avatar: UncheckedAccount<'info>,
+
+    /// CHECK: The avatar's `EquipmentRecord` PDA — address-bound by seeds and
+    /// allowed to be uninitialized. If it exists, the handler rejects
+    /// committing an item referenced by any of its v2 slots.
+    #[account(
+        seeds = [EQUIPMENT_SEED, player_avatar.key().as_ref()],
+        bump
+    )]
+    pub equipment_record: UncheckedAccount<'info>,
+
+    /// Per-item level tracker, created lazily on the first commit.
+    #[account(
+        init_if_needed,
+        payer = owner,
+        space = 8 + ItemEnhancement::INIT_SPACE,
+        seeds = [ENHANCEMENT_SEED, item_mint.key().as_ref()],
+        bump
+    )]
+    pub enhancement: Box<Account<'info, ItemEnhancement>>,
+
+    /// The scroll NFT mint being consumed.
+    pub scroll_mint: Box<Account<'info, Mint>>,
+
+    /// Proof the scroll was protocol-issued — a foreign NFT has no marker PDA
+    /// and fails deserialization here (the "no free scrolls" gate).
+    #[account(
+        seeds = [SCROLL_SEED, scroll_mint.key().as_ref()],
+        bump = scroll_marker.bump,
+    )]
+    pub scroll_marker: Box<Account<'info, EnhanceScrollMarker>>,
+
+    /// Owner's scroll token account — must hold exactly the 1 scroll token.
+    #[account(
+        mut,
+        associated_token::mint = scroll_mint,
+        associated_token::authority = owner,
+        constraint = scroll_token_account.amount == 1 @ ArenaRegistryError::NotScrollHolder,
+    )]
+    pub scroll_token_account: Box<Account<'info, TokenAccount>>,
+
+    #[account(
+        init,
+        payer = owner,
+        space = 8 + EnhanceCommit::INIT_SPACE,
+        seeds = [ENHANCE_COMMIT_SEED, owner.key().as_ref(), &nonce.to_le_bytes()],
+        bump
+    )]
+    pub enhance_commit: Box<Account<'info, EnhanceCommit>>,
+
+    /// Scroll escrow — an ATA owned by the commit PDA. Locks the scroll so it
+    /// cannot be sold after the odds are known.
+    #[account(
+        init,
+        payer = owner,
+        associated_token::mint = scroll_mint,
+        associated_token::authority = enhance_commit
+    )]
+    pub scroll_escrow: Box<Account<'info, TokenAccount>>,
+
+    #[account(mut)]
+    pub owner: Signer<'info>,
+
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, System>,
+}
+
+/// `reveal_enhance` — PERMISSIONLESS: any signer may reveal any pending
+/// commit once its target slot has passed, so a peeked loss can be forced
+/// through by a rival or keeper cron. The item sits in the commit PDA's
+/// escrow (v1.2) — the owner cannot transfer/revoke their way out of a
+/// failure. Success: level +1 and the item returns to the owner's ATA.
+/// Risky-zone failure: the item NFT is burned FROM ESCROW (Metaplex BurnNft,
+/// commit PDA signs) and its `ArenaItem` + `ItemEnhancement` PDAs close. The
+/// scroll burns REGARDLESS of outcome. ALL rent/refunds go to the commit's
+/// stored owner, never the caller. Single-shot.
+#[derive(Accounts)]
+#[instruction(nonce: u64)]
+pub struct RevealEnhance<'info> {
+    /// The pending commit; closed here, rent (plus every burn/escrow refund
+    /// credited to it) returns to the owner.
+    #[account(
+        mut,
+        close = owner,
+        has_one = owner @ ArenaRegistryError::EnhanceCommitMismatch,
+        has_one = item_mint @ ArenaRegistryError::EnhanceCommitMismatch,
+        has_one = scroll_mint @ ArenaRegistryError::EnhanceCommitMismatch,
+        seeds = [ENHANCE_COMMIT_SEED, owner.key().as_ref(), &nonce.to_le_bytes()],
+        bump = enhance_commit.bump,
+    )]
+    pub enhance_commit: Box<Account<'info, EnhanceCommit>>,
+
+    /// The item NFT mint (burned on a risky-zone failure).
+    #[account(mut)]
+    pub item_mint: Box<Account<'info, Mint>>,
+
+    #[account(
+        mut,
+        seeds = [ARENA_ITEM_SEED, item_mint.key().as_ref()],
+        bump = arena_item.bump,
+    )]
+    pub arena_item: Box<Account<'info, ArenaItem>>,
+
+    #[account(
+        mut,
+        seeds = [ENHANCEMENT_SEED, item_mint.key().as_ref()],
+        bump = enhancement.bump,
+    )]
+    pub enhancement: Box<Account<'info, ItemEnhancement>>,
+
+    /// Owner's item ATA — the success-path return destination. Recreated by
+    /// the caller if the owner closed it while the item was escrowed.
+    #[account(
+        init_if_needed,
+        payer = caller,
+        associated_token::mint = item_mint,
+        associated_token::authority = owner
+    )]
+    pub item_token_account: Box<Account<'info, TokenAccount>>,
+
+    /// Item escrow ATA (owned by the commit PDA, v1.2). Success: drained back
+    /// to the owner then closed (rent → owner). Failure: emptied by the
+    /// `BurnNft` CPI, which also closes it.
+    #[account(
+        mut,
+        associated_token::mint = item_mint,
+        associated_token::authority = enhance_commit,
+        constraint = item_escrow.amount == 1 @ ArenaRegistryError::EnhanceCommitMismatch,
+    )]
+    pub item_escrow: Box<Account<'info, TokenAccount>>,
+
+    /// CHECK: Metaplex metadata PDA of the item; closed by `BurnNft` on failure.
+    #[account(
+        mut,
+        seeds = [b"metadata", token_metadata_program.key().as_ref(), item_mint.key().as_ref()],
+        bump,
+        seeds::program = token_metadata_program.key()
+    )]
+    pub item_metadata: UncheckedAccount<'info>,
+
+    /// CHECK: Metaplex master edition PDA of the item; closed by `BurnNft` on failure.
+    #[account(
+        mut,
+        seeds = [b"metadata", token_metadata_program.key().as_ref(), item_mint.key().as_ref(), b"edition"],
+        bump,
+        seeds::program = token_metadata_program.key()
+    )]
+    pub item_master_edition: UncheckedAccount<'info>,
+
+    /// The escrowed scroll NFT mint — burned here regardless of outcome.
+    #[account(mut)]
+    pub scroll_mint: Box<Account<'info, Mint>>,
+
+    /// The consumed scroll's marker — closed with the scroll (rent → owner).
+    #[account(
+        mut,
+        close = owner,
+        seeds = [SCROLL_SEED, scroll_mint.key().as_ref()],
+        bump = scroll_marker.bump,
+    )]
+    pub scroll_marker: Box<Account<'info, EnhanceScrollMarker>>,
+
+    /// Scroll escrow ATA (owned by the commit PDA); closed by the `BurnNft` CPI.
+    #[account(
+        mut,
+        associated_token::mint = scroll_mint,
+        associated_token::authority = enhance_commit,
+        constraint = scroll_escrow.amount == 1 @ ArenaRegistryError::EnhanceCommitMismatch,
+    )]
+    pub scroll_escrow: Box<Account<'info, TokenAccount>>,
+
+    /// CHECK: Metaplex metadata PDA of the scroll; closed by the `BurnNft` CPI.
+    #[account(
+        mut,
+        seeds = [b"metadata", token_metadata_program.key().as_ref(), scroll_mint.key().as_ref()],
+        bump,
+        seeds::program = token_metadata_program.key()
+    )]
+    pub scroll_metadata: UncheckedAccount<'info>,
+
+    /// CHECK: Metaplex master edition PDA of the scroll; closed by the `BurnNft` CPI.
+    #[account(
+        mut,
+        seeds = [b"metadata", token_metadata_program.key().as_ref(), scroll_mint.key().as_ref(), b"edition"],
+        bump,
+        seeds::program = token_metadata_program.key()
+    )]
+    pub scroll_master_edition: UncheckedAccount<'info>,
+
+    /// CHECK: Address is bound by `enhance_commit.owner` (`has_one`). NOT a
+    /// signer — reveal is permissionless — but every closed account's rent
+    /// and burn refund lands here, never with the caller.
+    #[account(mut)]
+    pub owner: UncheckedAccount<'info>,
+
+    /// Any fee payer may reveal a pending commit once its slot has passed
+    /// (pays the owner-ATA re-creation rent in the rare closed-ATA case).
+    #[account(mut)]
+    pub caller: Signer<'info>,
+
+    /// CHECK: Address-constrained to the SlotHashes sysvar; read as raw data.
+    #[account(address = anchor_lang::solana_program::sysvar::slot_hashes::ID)]
+    pub slot_hashes: AccountInfo<'info>,
+
+    pub token_metadata_program: Program<'info, Metadata>,
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, System>,
+}
+
+/// Permissionless cleanup of an expired enhancement commit: the escrowed
+/// ITEM returns to the owner (v1.2), but the escrowed scroll is BURNED —
+/// abandoning always costs the full ticket, so peek-and-abandon has no free
+/// exit. The commit closes and the item's `pending` lock clears; every
+/// refunded lamport goes to the owner, never the closer. Fee-free (the closer
+/// pays only the tx fee, plus the owner-ATA re-creation rent in the rare
+/// closed-ATA case).
+#[derive(Accounts)]
+#[instruction(nonce: u64)]
+pub struct CloseExpiredEnhanceCommit<'info> {
+    #[account(
+        mut,
+        close = owner,
+        has_one = owner @ ArenaRegistryError::EnhanceCommitMismatch,
+        has_one = item_mint @ ArenaRegistryError::EnhanceCommitMismatch,
+        has_one = scroll_mint @ ArenaRegistryError::EnhanceCommitMismatch,
+        seeds = [ENHANCE_COMMIT_SEED, owner.key().as_ref(), &nonce.to_le_bytes()],
+        bump = enhance_commit.bump,
+    )]
+    pub enhance_commit: Box<Account<'info, EnhanceCommit>>,
+
+    /// CHECK: Address is bound by `enhance_commit.owner`; receives the item
+    /// and every refunded lamport even when a third party submits the cleanup.
+    #[account(mut)]
+    pub owner: UncheckedAccount<'info>,
+
+    /// The committed item's tracker — its `pending` lock is released here.
+    #[account(
+        mut,
+        seeds = [ENHANCEMENT_SEED, enhance_commit.item_mint.as_ref()],
+        bump = enhancement.bump,
+    )]
+    pub enhancement: Box<Account<'info, ItemEnhancement>>,
+
+    /// The escrowed item's NFT mint.
+    pub item_mint: Box<Account<'info, Mint>>,
+
+    /// Item escrow ATA (owned by the commit PDA); drained back to the owner
+    /// then closed (rent → owner).
+    #[account(
+        mut,
+        associated_token::mint = item_mint,
+        associated_token::authority = enhance_commit
+    )]
+    pub item_escrow: Box<Account<'info, TokenAccount>>,
+
+    /// Owner's item ATA — recreated by the closer if the owner closed it.
+    #[account(
+        init_if_needed,
+        payer = closer,
+        associated_token::mint = item_mint,
+        associated_token::authority = owner
+    )]
+    pub owner_item_account: Box<Account<'info, TokenAccount>>,
+
+    /// The escrowed scroll NFT mint — burned here (no refund).
+    #[account(mut)]
+    pub scroll_mint: Box<Account<'info, Mint>>,
+
+    /// The forfeited scroll's marker — closed with the scroll (rent → owner).
+    #[account(
+        mut,
+        close = owner,
+        seeds = [SCROLL_SEED, scroll_mint.key().as_ref()],
+        bump = scroll_marker.bump,
+    )]
+    pub scroll_marker: Box<Account<'info, EnhanceScrollMarker>>,
+
+    /// Scroll escrow ATA (owned by the commit PDA); closed by the `BurnNft`
+    /// CPI, refunds credited to the commit PDA → forwarded to the owner.
+    #[account(
+        mut,
+        associated_token::mint = scroll_mint,
+        associated_token::authority = enhance_commit
+    )]
+    pub scroll_escrow: Box<Account<'info, TokenAccount>>,
+
+    /// CHECK: Metaplex metadata PDA of the scroll; closed by the `BurnNft` CPI.
+    #[account(
+        mut,
+        seeds = [b"metadata", token_metadata_program.key().as_ref(), scroll_mint.key().as_ref()],
+        bump,
+        seeds::program = token_metadata_program.key()
+    )]
+    pub scroll_metadata: UncheckedAccount<'info>,
+
+    /// CHECK: Metaplex master edition PDA of the scroll; closed by the `BurnNft` CPI.
+    #[account(
+        mut,
+        seeds = [b"metadata", token_metadata_program.key().as_ref(), scroll_mint.key().as_ref(), b"edition"],
+        bump,
+        seeds::program = token_metadata_program.key()
+    )]
+    pub scroll_master_edition: UncheckedAccount<'info>,
+
+    /// Any fee payer may clean up an expired enhancement commitment.
+    #[account(mut)]
+    pub closer: Signer<'info>,
+
+    pub token_metadata_program: Program<'info, Metadata>,
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, System>,
 }
 
 /// Permissionless cleanup of a commitment after its deterministic reveal

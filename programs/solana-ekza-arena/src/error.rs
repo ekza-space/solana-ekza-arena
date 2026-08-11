@@ -72,4 +72,14 @@ pub enum ArenaRegistryError {
     InvalidEquipSlot,
     #[msg("The item's base type cannot be equipped into the requested slot.")]
     ItemSlotMismatch,
+    #[msg("The item is already at the maximum enhancement level.")]
+    EnhanceLevelMaxed,
+    #[msg("An enhancement commit is already pending for this item.")]
+    EnhancePending,
+    #[msg("The supplied account does not match the enhancement commit.")]
+    EnhanceCommitMismatch,
+    #[msg("The signer is not the current holder of the enhancement scroll NFT.")]
+    NotScrollHolder,
+    #[msg("The item is currently equipped; unequip it before enhancing.")]
+    ItemEquipped,
 }

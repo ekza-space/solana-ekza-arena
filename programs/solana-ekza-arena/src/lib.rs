@@ -119,4 +119,40 @@ pub mod solana_ekza_arena {
     pub fn unequip_item_v2(ctx: Context<UnequipItemV2>, slot: u8) -> Result<()> {
         handlers::unequip_item_v2(ctx, slot)
     }
+
+    /// Buy one consumable EnhanceScroll NFT for `commit_fee_lamports × 2`,
+    /// split to the same treasury/sink destinations as `commit_mint`.
+    pub fn mint_enhance_scroll(
+        ctx: Context<MintEnhanceScroll>,
+        args: MintEnhanceScrollArgs,
+    ) -> Result<()> {
+        handlers::mint_enhance_scroll(ctx, args)
+    }
+
+    /// Enhancement — step 1: escrow a scroll AND the item, and lock a future
+    /// slot for the roll (same commit-reveal shape as `commit_mint`).
+    /// Rejected while the item is equipped.
+    pub fn commit_enhance(ctx: Context<CommitEnhance>, nonce: u64) -> Result<()> {
+        handlers::commit_enhance(ctx, nonce)
+    }
+
+    /// Enhancement — step 2, PERMISSIONLESS: anyone may roll a pending commit
+    /// once its slot passed. Success = +1 level and the item returns from
+    /// escrow; a risky-zone failure burns the item from escrow. The scroll
+    /// burns either way; all rent goes to the commit's owner. `nonce`
+    /// re-derives the `EnhanceCommit` PDA.
+    pub fn reveal_enhance(ctx: Context<RevealEnhance>, nonce: u64) -> Result<()> {
+        handlers::reveal_enhance(ctx, nonce)
+    }
+
+    /// Permissionlessly close an expired enhancement commit: the escrowed
+    /// item returns to its owner, the scroll is BURNED (abandoning costs the
+    /// full ticket), and all rent returns to the committing owner, never the
+    /// caller.
+    pub fn close_expired_enhance_commit(
+        ctx: Context<CloseExpiredEnhanceCommit>,
+        nonce: u64,
+    ) -> Result<()> {
+        handlers::close_expired_enhance_commit(ctx, nonce)
+    }
 }

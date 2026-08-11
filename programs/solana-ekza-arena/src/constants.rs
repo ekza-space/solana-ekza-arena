@@ -76,6 +76,48 @@ pub const DEFAULT_SINK_BPS: u16 = 1_000;
 #[constant]
 pub const ITEM_ROYALTY_BPS: u16 = 500;
 
+// ---------------------------------------------------------------------------
+// Item enhancement («заточка», docs/enhancement-design.md): scroll-consuming
+// commit-reveal upgrade attempts.
+// ---------------------------------------------------------------------------
+
+/// `ItemEnhancement` PDA seed: `["enhancement", item_mint]` — per-item level
+/// tracker, kept SEPARATE from `ArenaItem` so the deployed layout never moves.
+#[constant]
+pub const ENHANCEMENT_SEED: &[u8] = b"enhancement";
+
+/// `EnhanceScrollMarker` PDA seed: `["scroll", scroll_mint]`. Only the
+/// fee-paying `mint_enhance_scroll` issues markers — no marker, no reveal.
+#[constant]
+pub const SCROLL_SEED: &[u8] = b"scroll";
+
+/// `EnhanceCommit` PDA seed: `["enhance_commit", owner, nonce_le]`.
+#[constant]
+pub const ENHANCE_COMMIT_SEED: &[u8] = b"enhance_commit";
+
+/// Scroll price = `registry.commit_fee_lamports × SCROLL_FEE_MULTIPLIER`,
+/// with the same treasury/sink split as `commit_mint` (no ArenaRegistry
+/// layout change — the fee rides on the existing governed knob).
+#[constant]
+pub const SCROLL_FEE_MULTIPLIER: u64 = 2;
+
+/// Enhancement level cap: +10 is the top of the ladder.
+#[constant]
+pub const MAX_ENHANCE_LEVEL: u8 = 10;
+
+/// Per-mille success chance of the attempt `level -> level + 1`, indexed by
+/// the CURRENT level. +1..+3 are the safe zone (1000‰); from +4 every failure
+/// destroys the item. KEEP THE TABLE IN THIS ONE CONST (enhancement spec) —
+/// tuning happens here and only here.
+pub const SUCCESS_BPS: [u16; MAX_ENHANCE_LEVEL as usize] =
+    [1000, 1000, 1000, 700, 500, 350, 250, 175, 120, 80];
+
+/// Denominator of the `SUCCESS_BPS` per-mille table.
+pub const ENHANCE_ROLL_DENOMINATOR: u64 = 1000;
+
+/// Metaplex `symbol` every protocol-issued enhancement scroll carries.
+pub const SCROLL_SYMBOL: &str = "EKZASCROLL";
+
 #[constant]
 pub const STELLAR_LINK_SEED: &[u8] = b"stellar_arena_link";
 

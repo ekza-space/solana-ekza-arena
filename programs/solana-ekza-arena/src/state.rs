@@ -408,8 +408,10 @@ pub struct ArenaItem {
     /// seeded by this mint (spec §11.2).
     pub mint: Pubkey,
     pub index: u64,
-    /// Forward-compat (spec §12.3): sharpening level. Defaulted 0 at mint; no
-    /// instruction mutates it yet (v5 `sharpen_item`).
+    /// Sharpening level MIRROR. Defaulted 0 at mint; `reveal_enhance` writes
+    /// it on every successful attempt, in lockstep with the authoritative
+    /// `ItemEnhancement.level` (["enhancement", mint]), so pre-enhancement
+    /// readers of `ArenaItem` stay coherent.
     pub enhance_level: u8,
     /// Forward-compat (spec §12.3): gem sockets. Defaulted empty at mint, space
     /// reserved for MAX_SOCKETS; no instruction mutates it yet (v5 `socket_gem`).
@@ -533,6 +535,100 @@ pub struct CustomizeAvatarArgs {
     /// Cosmetic skin override. Only `Builtin`/`Ipfs` are accepted here (Stellar
     /// skins enter via the avatar card's own `skin_ref`).
     pub skin: Option<MintSkinArg>,
+}
+
+// ---------------------------------------------------------------------------
+// Item enhancement («заточка», docs/enhancement-design.md): consumable scroll
+// NFTs + a per-item level PDA + a commit-reveal upgrade roll.
+// ---------------------------------------------------------------------------
+
+/// Per-item enhancement tracker — PDA `["enhancement", item_mint]`.
+///
+/// Created lazily on the first `commit_enhance` for an item. Kept SEPARATE
+/// from `ArenaItem` so the deployed account layout does not change (no
+/// migration). `level` here is AUTHORITATIVE; `ArenaItem.enhance_level` is a
+/// mirror written in lockstep on every successful reveal. Read side:
+/// `effective_stat = base * (100 + 8 * level) / 100`, computed off-chain by
+/// the SDK/web from `level`.
+#[account]
+pub struct ItemEnhancement {
+    /// The item NFT mint this tracker belongs to (PDA seed).
+    pub item_mint: Pubkey,
+    /// Current enhancement level, 0..=MAX_ENHANCE_LEVEL.
+    pub level: u8,
+    /// Lifetime attempts (analytics).
+    pub attempts: u16,
+    /// True while an `EnhanceCommit` is open for this item — blocks a second
+    /// concurrent commit (the spec's "no open commit for this item" guard).
+    pub pending: bool,
+    pub bump: u8,
+}
+
+impl ItemEnhancement {
+    pub const INIT_SPACE: usize = 32 // item_mint
+        + 1 // level
+        + 2 // attempts
+        + 1 // pending
+        + 1; // bump
+}
+
+/// Marker PDA `["scroll", scroll_mint]` proving the scroll NFT was issued by
+/// the fee-paying `mint_enhance_scroll` — a foreign NFT has no marker and can
+/// never enter `commit_enhance` (the spec's "no free scrolls" rule).
+#[account]
+pub struct EnhanceScrollMarker {
+    pub scroll_mint: Pubkey,
+    pub bump: u8,
+}
+
+impl EnhanceScrollMarker {
+    pub const INIT_SPACE: usize = 32 + 1;
+}
+
+/// A pending enhancement attempt, committed to a FUTURE slot — same
+/// commit-reveal shape as `MintCommit`. The scroll sits escrowed in an ATA
+/// owned by this PDA until `reveal_enhance` burns it (any outcome) or
+/// `close_expired_enhance_commit` returns it.
+#[account]
+pub struct EnhanceCommit {
+    pub owner: Pubkey,
+    pub nonce: u64,
+    /// The item NFT mint whose enhancement this commit rolls.
+    pub item_mint: Pubkey,
+    /// The escrowed scroll NFT mint.
+    pub scroll_mint: Pubkey,
+    /// Slot whose hash seeds the roll; reveal must wait until `Clock::slot`
+    /// has passed it AND the hash is still in the SlotHashes sysvar.
+    pub target_slot: u64,
+    pub bump: u8,
+}
+
+impl EnhanceCommit {
+    pub const INIT_SPACE: usize = 32 // owner
+        + 8 // nonce
+        + 32 // item_mint
+        + 32 // scroll_mint
+        + 8 // target_slot
+        + 1; // bump
+}
+
+/// Args for `mint_enhance_scroll` — Metaplex name/uri only; the symbol is
+/// forced to `SCROLL_SYMBOL` so every scroll is recognizable.
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug, PartialEq, Eq)]
+pub struct MintEnhanceScrollArgs {
+    pub name: String,
+    pub uri: String,
+}
+
+/// Outcome of one `reveal_enhance`.
+#[event]
+pub struct EnhanceResult {
+    pub item_mint: Pubkey,
+    pub level_before: u8,
+    pub success: bool,
+    /// True only on a risky-zone failure: the item NFT was burned and its
+    /// `ArenaItem` + `ItemEnhancement` PDAs were closed (rent → owner).
+    pub destroyed: bool,
 }
 
 // ---------------------------------------------------------------------------

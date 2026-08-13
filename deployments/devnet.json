@@ -39,9 +39,11 @@
       "programId": "9A5PkCQrsp98SNBfVRiRs5zVdnzxVdRZQFy2ZDDGjaeU",
       "programdataAddress": "6grSTXx5HMs4bfpktRi1cZKF4UCR9hSbbFtmVeasrjFz",
       "lastDeploySlot": 478325634,
-      "dataLen": 270792,
-      "binarySha256": "87433f537323521b6ac6477cc703a4064212d63cf8a8563b2b9617e819673d90",
-      "deploySignature": "5qtKk7pRJQDBXGG6ruqGWkAzeyhqXDYohivcMRmX37cAXx3jnxkuFkznm3Y6mg5mSiH5MVdGsYtBEFJUuUiRDAzV"
+      "dataLen": 416232,
+      "binarySha256": "d297b8b2c5ab60c2f734e42aba7df09fe0d21b605ee3979f89fe091bd2baa829",
+      "deploySignature": "5qtKk7pRJQDBXGG6ruqGWkAzeyhqXDYohivcMRmX37cAXx3jnxkuFkznm3Y6mg5mSiH5MVdGsYtBEFJUuUiRDAzV",
+      "upgradeSignature_2026-08-13_pvp": "3nFcbz8PGtAwEpvzv7kdiS699ix3hp4JVC2AgivtdNxGby36Kvvqr4EqSYkpWChUkzw5W5Wi5ThCVtDT5aQLgv8T",
+      "note": "async PvP ladder + per-character history added; upgraded 2026-08-13 (extend +150000 then buffer swap)"
     }
   },
   "arenaRegistry": {

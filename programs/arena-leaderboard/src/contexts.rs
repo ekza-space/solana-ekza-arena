@@ -1,8 +1,15 @@
 use anchor_lang::prelude::*;
 
 use crate::{
-    constants::{BATTLE_RATE_LIMIT_SEED, PLAYER_STATS_SEED},
-    state::{BattleRateLimit, Leaderboard, PlayerStats},
+    constants::{
+        ARENA_SNAPSHOT_SEED, BATTLE_RATE_LIMIT_SEED, CHALLENGE_SEED, CHAR_RECORD_SEED,
+        PAIR_COOLDOWN_SEED, PLAYER_STATS_SEED,
+    },
+    handlers::PublishSnapshotArgs,
+    state::{
+        ArenaSnapshot, BattleRateLimit, Challenge, CharRecord, Leaderboard, PairCooldown,
+        PlayerStats,
+    },
 };
 
 #[derive(Accounts)]
@@ -130,4 +137,190 @@ pub struct SetProfile<'info> {
     /// Profile edits are wallet-only (deliberately NOT session-key signable:
     /// a leaked burner must not be able to deface a top player's profile).
     pub player: Signer<'info>,
+}
+
+// ===========================================================================
+// Async PvP ladder contexts (design §2). New PDAs + instructions only.
+// ===========================================================================
+
+/// Capture the caller's current build as an on-chain ghost.
+/// `["arena_snapshot_v1", owner]`, one per wallet; republishing overwrites.
+#[derive(Accounts)]
+#[instruction(args: PublishSnapshotArgs)]
+pub struct PublishSnapshot<'info> {
+    #[account(
+        init_if_needed,
+        payer = owner,
+        space = 8 + ArenaSnapshot::INIT_SPACE,
+        seeds = [ARENA_SNAPSHOT_SEED, owner.key().as_ref()],
+        bump
+    )]
+    pub arena_snapshot: Account<'info, ArenaSnapshot>,
+
+    #[account(mut)]
+    pub owner: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+/// Leave the ghost pool; rent returns to the owner.
+#[derive(Accounts)]
+pub struct UnpublishSnapshot<'info> {
+    #[account(
+        mut,
+        close = owner,
+        has_one = owner,
+        seeds = [ARENA_SNAPSHOT_SEED, owner.key().as_ref()],
+        bump = arena_snapshot.bump,
+    )]
+    pub arena_snapshot: Account<'info, ArenaSnapshot>,
+
+    /// `mut` because `close = owner` credits the reclaimed rent to this wallet.
+    #[account(mut)]
+    pub owner: Signer<'info>,
+}
+
+/// Lock an opponent ghost + a future target slot. `["challenge_v1", challenger,
+/// nonce]` — the nonce lets one wallet keep several open challenges.
+#[derive(Accounts)]
+#[instruction(nonce: u64)]
+pub struct CommitChallenge<'info> {
+    #[account(
+        init,
+        payer = challenger,
+        space = 8 + Challenge::INIT_SPACE,
+        seeds = [CHALLENGE_SEED, challenger.key().as_ref(), &nonce.to_le_bytes()],
+        bump
+    )]
+    pub challenge: Account<'info, Challenge>,
+
+    /// The challenger's own published ghost must exist — it is the build that
+    /// fights. The PDA seed binds `challenger_snapshot.owner == challenger`.
+    #[account(
+        seeds = [ARENA_SNAPSHOT_SEED, challenger.key().as_ref()],
+        bump = challenger_snapshot.bump,
+    )]
+    pub challenger_snapshot: Account<'info, ArenaSnapshot>,
+
+    /// The chosen opponent ghost, locked into the challenge at commit time.
+    pub opponent_snapshot: Account<'info, ArenaSnapshot>,
+
+    #[account(mut)]
+    pub challenger: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+/// PERMISSIONLESS resolve (design §2.7). `payer` is the only signer, trusted for
+/// nothing but funding lazy inits + pushing the tx; every value is program-computed.
+#[derive(Accounts)]
+#[instruction(nonce: u64, pair_lo: Pubkey, pair_hi: Pubkey)]
+pub struct ResolveChallenge<'info> {
+    #[account(
+        mut,
+        close = challenger,
+        has_one = challenger,
+        seeds = [CHALLENGE_SEED, challenger.key().as_ref(), &nonce.to_le_bytes()],
+        bump = challenge.bump,
+    )]
+    pub challenge: Box<Account<'info, Challenge>>,
+
+    /// CHECK: rent destination for the closed challenge; bound by `has_one` on
+    /// `challenge.challenger` and by the challenge PDA seeds. Does not sign.
+    #[account(mut)]
+    pub challenger: UncheckedAccount<'info>,
+
+    // The typed accounts below are `Box`ed to keep `try_accounts` off the 4 KB
+    // BPF stack — five `init_if_needed` accounts otherwise overflow the frame.
+    #[account(
+        seeds = [ARENA_SNAPSHOT_SEED, challenger.key().as_ref()],
+        bump = challenger_snapshot.bump,
+    )]
+    pub challenger_snapshot: Box<Account<'info, ArenaSnapshot>>,
+
+    /// Bound to the pairing locked at commit; the opponent's own signed build.
+    #[account(address = challenge.opponent_snapshot)]
+    pub opponent_snapshot: Box<Account<'info, ArenaSnapshot>>,
+
+    #[account(
+        init_if_needed,
+        payer = payer,
+        space = 8 + PlayerStats::INIT_SPACE,
+        seeds = [PLAYER_STATS_SEED, challenger.key().as_ref()],
+        bump
+    )]
+    pub challenger_stats: Box<Account<'info, PlayerStats>>,
+
+    #[account(
+        init_if_needed,
+        payer = payer,
+        space = 8 + PlayerStats::INIT_SPACE,
+        seeds = [PLAYER_STATS_SEED, opponent_snapshot.owner.as_ref()],
+        bump
+    )]
+    pub opponent_stats: Box<Account<'info, PlayerStats>>,
+
+    #[account(
+        init_if_needed,
+        payer = payer,
+        space = 8 + CharRecord::INIT_SPACE,
+        seeds = [CHAR_RECORD_SEED, challenger.key().as_ref(), challenger_snapshot.avatar_ref.as_ref()],
+        bump
+    )]
+    pub challenger_char: Box<Account<'info, CharRecord>>,
+
+    #[account(
+        init_if_needed,
+        payer = payer,
+        space = 8 + CharRecord::INIT_SPACE,
+        seeds = [CHAR_RECORD_SEED, opponent_snapshot.owner.as_ref(), opponent_snapshot.avatar_ref.as_ref()],
+        bump
+    )]
+    pub opponent_char: Box<Account<'info, CharRecord>>,
+
+    /// Order-independent pair throttle. Seeds come from the `pair_lo`/`pair_hi`
+    /// args; the handler enforces they equal `sort(challenger, opponent_owner)`.
+    #[account(
+        init_if_needed,
+        payer = payer,
+        space = 8 + PairCooldown::INIT_SPACE,
+        seeds = [PAIR_COOLDOWN_SEED, pair_lo.as_ref(), pair_hi.as_ref()],
+        bump
+    )]
+    pub pair_cooldown: Box<Account<'info, PairCooldown>>,
+
+    /// The ranked board; the min-games-gated heap upsert writes here.
+    #[account(mut)]
+    pub leaderboard: AccountLoader<'info, Leaderboard>,
+
+    /// CHECK: Address-constrained to the SlotHashes sysvar; read as raw data.
+    #[account(address = anchor_lang::solana_program::sysvar::slot_hashes::ID)]
+    pub slot_hashes: AccountInfo<'info>,
+
+    /// Any key may push the resolve and fund lazy inits (permissionless).
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+/// Reclaim rent from a challenge whose reveal window aged out. Permissionless.
+#[derive(Accounts)]
+#[instruction(nonce: u64)]
+pub struct CloseExpiredChallenge<'info> {
+    #[account(
+        mut,
+        close = challenger,
+        has_one = challenger,
+        seeds = [CHALLENGE_SEED, challenger.key().as_ref(), &nonce.to_le_bytes()],
+        bump = challenge.bump,
+    )]
+    pub challenge: Account<'info, Challenge>,
+
+    /// CHECK: rent destination; bound by `has_one` on `challenge.challenger`.
+    #[account(mut)]
+    pub challenger: UncheckedAccount<'info>,
+
+    /// Any fee payer may clean up an expired challenge.
+    pub closer: Signer<'info>,
 }

@@ -285,6 +285,8 @@ version = "0.1.0"
 dependencies = [
  "anchor-lang",
  "bytemuck",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

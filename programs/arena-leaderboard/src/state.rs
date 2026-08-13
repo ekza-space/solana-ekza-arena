@@ -2,7 +2,8 @@ use anchor_lang::prelude::*;
 
 use crate::{
     constants::{
-        MAX_BATTLES_PER_UTC_DAY, MAX_CAPACITY, MIN_BATTLE_COOLDOWN_SLOTS, SECONDS_PER_DAY,
+        MAX_BATTLES_PER_UTC_DAY, MAX_CAPACITY, MAX_RANKED_PER_PAIR_PER_DAY,
+        MIN_BATTLE_COOLDOWN_SLOTS, PAIR_COOLDOWN_SLOTS, SECONDS_PER_DAY,
     },
     error::LeaderboardError,
 };
@@ -276,6 +277,217 @@ impl BattleRateLimit {
         self.last_battle_slot = slot;
         self.has_recorded_battle = true;
         Ok(())
+    }
+}
+
+// ===========================================================================
+// Async PvP ladder state (design §2/§3). All ADDITIVE — new PDAs only; the
+// PlayerStats / Leaderboard / BattleRateLimit layouts above are untouched.
+// ===========================================================================
+
+/// Engine-ready total stats (base + equipment folded), captured at publish.
+/// Mirrors the web `Stats` fold `opponentSnapshot()` already uses.
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct ArenaStatsLite {
+    pub hp: i16,
+    pub attack: i16,
+    pub armor: i16,
+    pub speed: i16,
+}
+
+/// A player's published build ("ghost"): `["arena_snapshot_v1", owner]`.
+/// Self-contained + engine-ready so `resolve_challenge` needs no CPI (design §2.1).
+#[account]
+pub struct ArenaSnapshot {
+    /// PDA seed; the ghost's wallet.
+    pub owner: Pubkey,
+    /// ArenaAssetData avatar-card pubkey (== PlayerAvatar.avatar_asset); the
+    /// per-character key its `CharRecord` accrues to.
+    pub avatar_ref: Pubkey,
+    /// Display handle, utf-8 zero-padded (e.g. "ember_witch").
+    pub archetype_id: [u8; 32],
+    /// ENGINE-READY total stats used verbatim by the on-chain sim.
+    pub stats: ArenaStatsLite,
+    /// Active skills as a bitmask (sim canonical order; see `sim.rs`).
+    pub skill_mask: u8,
+    /// 0 None, 1 Fire, ... (mirrors ArenaElement); display only, ignored by resolve.
+    pub element: u8,
+    /// Cosmetic ref (avatar skin) — display only, ignored by resolve.
+    pub skin_ref: [u8; 32],
+    /// Owner rating snapshot at publish time (matchmaking hint only).
+    pub rating_at_publish: i32,
+    /// Freshness marker.
+    pub published_slot: u64,
+    pub bump: u8,
+}
+
+impl ArenaSnapshot {
+    pub const INIT_SPACE: usize = 32 // owner
+        + 32 // avatar_ref
+        + 32 // archetype_id
+        + 8 // stats (4 * i16)
+        + 1 // skill_mask
+        + 1 // element
+        + 32 // skin_ref
+        + 4 // rating_at_publish
+        + 8 // published_slot
+        + 1; // bump
+
+    /// Sim-ready combatant view. Identity = this snapshot ACCOUNT pubkey (the
+    /// design §1 parity requirement), promoted stats to i32.
+    pub fn combatant(&self, snapshot_key: &Pubkey) -> crate::sim::Combatant {
+        crate::sim::Combatant {
+            identity: snapshot_key.to_bytes(),
+            hp: self.stats.hp as i32,
+            attack: self.stats.attack as i32,
+            armor: self.stats.armor as i32,
+            speed: self.stats.speed as i32,
+            skill_mask: self.skill_mask,
+        }
+    }
+}
+
+/// A commit to fight a specific ghost at a future slot:
+/// `["challenge_v1", challenger, nonce]` (design §2.2). Locking the opponent +
+/// a future target slot at commit is the revert-grind / re-pick defense.
+#[account]
+pub struct Challenge {
+    pub challenger: Pubkey,
+    pub nonce: u64,
+    /// The ghost ArenaSnapshot chosen AT COMMIT (locks the pairing).
+    pub opponent_snapshot: Pubkey,
+    /// commit_slot + PVP_REVEAL_DELAY_SLOTS; its hash seeds the fight.
+    pub target_slot: u64,
+    pub bump: u8,
+}
+
+impl Challenge {
+    pub const INIT_SPACE: usize = 32 // challenger
+        + 8 // nonce
+        + 32 // opponent_snapshot
+        + 8 // target_slot
+        + 1; // bump
+}
+
+/// Per-character W/L: `["char_record_v1", owner, avatar_ref]` (design §3).
+/// Persists across avatar swaps; keyed by the avatar-card pubkey.
+#[account]
+pub struct CharRecord {
+    pub owner: Pubkey,
+    pub avatar_ref: Pubkey,
+    pub wins: u32,
+    pub losses: u32,
+    pub games: u32,
+    pub streak: u16,
+    pub best_streak: u16,
+    pub last_played_slot: u64,
+    pub bump: u8,
+}
+
+impl CharRecord {
+    pub const INIT_SPACE: usize = 32 // owner
+        + 32 // avatar_ref
+        + 4 // wins
+        + 4 // losses
+        + 4 // games
+        + 2 // streak
+        + 2 // best_streak
+        + 8 // last_played_slot
+        + 1; // bump
+
+    /// Lazy init on a freshly zeroed PDA (recognized by the unset owner).
+    pub fn initialize_if_needed(&mut self, owner: Pubkey, avatar_ref: Pubkey, bump: u8) {
+        if self.owner == Pubkey::default() {
+            self.owner = owner;
+            self.avatar_ref = avatar_ref;
+            self.bump = bump;
+        }
+    }
+
+    /// Record one PvP result for this character.
+    pub fn record(&mut self, won: bool, slot: u64) {
+        self.games = self.games.saturating_add(1);
+        if won {
+            self.wins = self.wins.saturating_add(1);
+            self.streak = self.streak.saturating_add(1);
+            self.best_streak = self.best_streak.max(self.streak);
+        } else {
+            self.losses = self.losses.saturating_add(1);
+            self.streak = 0;
+        }
+        self.last_played_slot = slot;
+    }
+}
+
+/// Order-independent per-pair rated-result throttle:
+/// `["pair_cd_v1", sort(challenger, opponent_owner)]` (design §4). Repeats
+/// within the cooldown / daily cap resolve as no-rating exhibitions.
+#[account]
+pub struct PairCooldown {
+    pub key_lo: Pubkey,
+    pub key_hi: Pubkey,
+    /// Last slot this pair produced a RATED result (0 = never).
+    pub last_ranked_slot: u64,
+    pub ranked_today: u16,
+    pub utc_day: i64,
+    pub bump: u8,
+}
+
+impl PairCooldown {
+    pub const INIT_SPACE: usize = 32 // key_lo
+        + 32 // key_hi
+        + 8 // last_ranked_slot
+        + 2 // ranked_today
+        + 8 // utc_day
+        + 1; // bump
+
+    /// Sort two wallets into the order-independent `(lo, hi)` pair key.
+    pub fn sort_keys(a: Pubkey, b: Pubkey) -> (Pubkey, Pubkey) {
+        if a.to_bytes() <= b.to_bytes() {
+            (a, b)
+        } else {
+            (b, a)
+        }
+    }
+
+    /// Decide whether THIS fight is rated, and consume the pair allowance when
+    /// it is. Returns true for a RATED result, false for an exhibition. A rated
+    /// result requires: no prior rated result within `PAIR_COOLDOWN_SLOTS`, and
+    /// the per-UTC-day rated cap not yet reached.
+    pub fn consume_rated(
+        &mut self,
+        lo: Pubkey,
+        hi: Pubkey,
+        bump: u8,
+        slot: u64,
+        unix_timestamp: i64,
+    ) -> bool {
+        if self.key_lo == Pubkey::default() && self.key_hi == Pubkey::default() {
+            self.key_lo = lo;
+            self.key_hi = hi;
+            self.bump = bump;
+        }
+
+        let day = unix_timestamp.div_euclid(SECONDS_PER_DAY);
+        if day > self.utc_day {
+            self.utc_day = day;
+            self.ranked_today = 0;
+        }
+
+        let mut rated = true;
+        if self.last_ranked_slot != 0 && slot < self.last_ranked_slot + PAIR_COOLDOWN_SLOTS {
+            rated = false; // still cooling down from the last rated fight
+        }
+        if self.ranked_today >= MAX_RANKED_PER_PAIR_PER_DAY {
+            rated = false; // per-day rated cap reached
+        }
+
+        if rated {
+            // slot.max(1) keeps 0 meaningful as the "never rated" sentinel.
+            self.last_ranked_slot = slot.max(1);
+            self.ranked_today = self.ranked_today.saturating_add(1);
+        }
+        rated
     }
 }
 

@@ -55,3 +55,55 @@ pub const MAX_BATTLES_PER_UTC_DAY: u16 = 20;
 
 /// Used to derive a stable UTC-day index from the on-chain Clock timestamp.
 pub const SECONDS_PER_DAY: i64 = 86_400;
+
+// ---------------------------------------------------------------------------
+// Async PvP ladder (ghost snapshots + commit/reveal challenges). All additive;
+// no existing constant changes.
+// ---------------------------------------------------------------------------
+
+/// `ArenaSnapshot` PDA seed: `["arena_snapshot_v1", owner]` — one live ghost
+/// per wallet; republishing overwrites in place.
+#[constant]
+pub const ARENA_SNAPSHOT_SEED: &[u8] = b"arena_snapshot_v1";
+
+/// `Challenge` PDA seed: `["challenge_v1", challenger, nonce]`.
+#[constant]
+pub const CHALLENGE_SEED: &[u8] = b"challenge_v1";
+
+/// `CharRecord` PDA seed: `["char_record_v1", owner, avatar_ref]` — per-character
+/// W/L that persists across avatar swaps.
+#[constant]
+pub const CHAR_RECORD_SEED: &[u8] = b"char_record_v1";
+
+/// `PairCooldown` PDA seed: `["pair_cd_v1", key_lo, key_hi]` with
+/// `(key_lo, key_hi) = sort(challenger, opponent_owner)` (order-independent).
+#[constant]
+pub const PAIR_COOLDOWN_SEED: &[u8] = b"pair_cd_v1";
+
+/// Slots between `commit_challenge` and the earliest `resolve_challenge`. The
+/// target slot's hash (unknown at commit) seeds the fight — revert-grind
+/// resistant, mirrors the mint commit/reveal path (`solana-ekza-arena`).
+#[constant]
+pub const PVP_REVEAL_DELAY_SLOTS: u64 = 5;
+
+/// Lifetime of a committed challenge after its target slot. Past this, the
+/// target slot's hash has aged out of SlotHashes; `close_expired_challenge`
+/// reclaims the rent. Mirrors `COMMIT_REVEAL_WINDOW_SLOTS`.
+#[constant]
+pub const PVP_COMMIT_WINDOW_SLOTS: u64 = 128;
+
+/// Elo K-factor for the opponent-scaled PvP rating delta (design §4).
+pub const PVP_ELO_K: i32 = 24;
+
+/// A wallet is hidden from the ranked heap / matchmaking pool until it has this
+/// many PvP games (anti-sybil heap-spam gate, design §4).
+pub const MIN_RANKED_GAMES: u32 = 3;
+
+/// A given pair yields a RATED result at most once per this many slots; sooner
+/// repeats resolve as no-rating exhibitions (self-play throttle, design §4).
+#[constant]
+pub const PAIR_COOLDOWN_SLOTS: u64 = 150;
+
+/// Hard cap on RATED results per pair per UTC day (secondary self-play throttle).
+#[constant]
+pub const MAX_RANKED_PER_PAIR_PER_DAY: u16 = 5;

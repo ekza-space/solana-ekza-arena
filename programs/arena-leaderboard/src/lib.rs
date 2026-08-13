@@ -16,6 +16,7 @@ pub mod constants;
 pub mod contexts;
 pub mod error;
 pub mod handlers;
+pub mod sim;
 pub mod state;
 
 pub use contexts::*;
@@ -67,5 +68,49 @@ pub mod arena_leaderboard {
     /// the player does not currently hold a heap slot. Wallet-signed.
     pub fn set_profile(ctx: Context<SetProfile>, name: String, uri: String) -> Result<()> {
         handlers::set_profile(ctx, name, uri)
+    }
+
+    // --- Async PvP ladder (ghost snapshots + trustless commit/reveal) -------
+
+    /// Publish (or overwrite) the caller's build as an on-chain ghost snapshot
+    /// (`["arena_snapshot_v1", owner]`). MVP trusts the client-captured stats.
+    pub fn publish_snapshot(
+        ctx: Context<PublishSnapshot>,
+        args: handlers::PublishSnapshotArgs,
+    ) -> Result<()> {
+        handlers::publish_snapshot(ctx, args)
+    }
+
+    /// Leave the ghost pool; the snapshot's rent returns to the owner.
+    pub fn unpublish_snapshot(ctx: Context<UnpublishSnapshot>) -> Result<()> {
+        handlers::unpublish_snapshot(ctx)
+    }
+
+    /// Commit to fight a specific opponent ghost at a future slot. Locks the
+    /// pairing + `target_slot` (whose hash later seeds the fight). Wallet or
+    /// session-key signed.
+    pub fn commit_challenge(ctx: Context<CommitChallenge>, nonce: u64) -> Result<()> {
+        handlers::commit_challenge(ctx, nonce)
+    }
+
+    /// PERMISSIONLESS resolve: recompute the winner on-chain from both snapshots
+    /// + the slot-hash seed, dual-write both PlayerStats + both CharRecord,
+    /// apply opponent-scaled elo (honoring PairCooldown exhibitions + the
+    /// min-games heap gate), and close the challenge. Anyone can push it —
+    /// that is the anti-loss-dodge mechanism. `pair_lo`/`pair_hi` are the sorted
+    /// `(challenger, opponent_owner)` pair (validated on-chain).
+    pub fn resolve_challenge(
+        ctx: Context<ResolveChallenge>,
+        nonce: u64,
+        pair_lo: Pubkey,
+        pair_hi: Pubkey,
+    ) -> Result<()> {
+        handlers::resolve_challenge(ctx, nonce, pair_lo, pair_hi)
+    }
+
+    /// Permissionless: reclaim the rent of a challenge whose reveal window aged
+    /// out of SlotHashes without a resolve.
+    pub fn close_expired_challenge(ctx: Context<CloseExpiredChallenge>, nonce: u64) -> Result<()> {
+        handlers::close_expired_challenge(ctx, nonce)
     }
 }

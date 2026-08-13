@@ -24,4 +24,21 @@ pub enum LeaderboardError {
     BattleCooldownActive,
     #[msg("This player has reached the maximum number of battle records for the current UTC day.")]
     DailyBattleLimitReached,
+    // --- Async PvP (ghost snapshots + commit/reveal challenges) ---
+    #[msg("A challenge cannot target your own published snapshot.")]
+    SelfSnapshotNotAllowed,
+    #[msg("The challenge's target slot has not passed yet; reveal is too early.")]
+    RevealTooEarly,
+    #[msg("The challenge's reveal window has expired; close it to reclaim rent.")]
+    ChallengeWindowExpired,
+    #[msg("The challenge is not expired yet.")]
+    ChallengeNotExpired,
+    #[msg("Invalid SlotHashes sysvar account.")]
+    InvalidSlotHashes,
+    #[msg("The committed target slot's hash is no longer in the SlotHashes sysvar.")]
+    SlotHashNotFound,
+    #[msg("Snapshot/PDA account does not match the challenge it is resolved against.")]
+    SnapshotMismatch,
+    #[msg("The provided pair-cooldown key pair is not the sorted (challenger, opponent) pair.")]
+    InvalidPairKeys,
 }

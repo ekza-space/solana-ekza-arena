@@ -6,6 +6,15 @@ pub const ARENA_ASSET_SEED: &[u8] = b"arena_asset_v1";
 #[constant]
 pub const ARENA_ITEM_SEED: &[u8] = b"arena_item_v1";
 
+/// Canonical proof PDA for a protocol-minted playable fighter:
+/// `["arena_avatar_v1", fighter_nft_mint]`.
+///
+/// A Metaplex `EKZAF*` symbol is only a routing hint and is trivially
+/// forgeable by another program. Clients authenticate a fighter by deriving
+/// this PDA under the Arena program and reading its `ArenaAssetData`.
+#[constant]
+pub const ARENA_AVATAR_SEED: &[u8] = b"arena_avatar_v1";
+
 /// Number of built-in skin ids (0..MAX_BUILTIN_SKINS exclusive are valid).
 pub const MAX_BUILTIN_SKINS: u8 = 64;
 
@@ -35,7 +44,8 @@ pub const PLAYER_AVATAR_SEED: &[u8] = b"player_avatar_v1";
 pub const EQUIPMENT_SEED: &[u8] = b"equipment";
 
 /// Slots to wait between `commit_mint` and `reveal_mint` (spec §12.1/§12.5).
-/// The target slot's hash is unknown at commit time, killing revert-grinding.
+/// The first produced slot hash at/after the target is unknown at commit time,
+/// killing revert-grinding while remaining safe when the target slot is skipped.
 ///
 /// NOTE: the spec's placeholder default is 1, but §12.5 lists this as an open
 /// tunable. We pin it to 5 so the reveal window is observable in tests (with a
@@ -48,10 +58,10 @@ pub const REVEAL_DELAY_SLOTS: u64 = 5;
 ///
 /// Keeping an explicit bound makes stale commits recoverable without trusting
 /// a caller-provided clock or waiting for implementation-specific SlotHashes
-/// retention. At normal Solana slot times this leaves roughly 50 seconds after
-/// the target slot for the reveal transaction.
+/// retention. 300 slots leaves roughly two minutes for a mobile/external-wallet
+/// approval while retaining comfortable headroom inside the SlotHashes history.
 #[constant]
-pub const COMMIT_REVEAL_WINDOW_SLOTS: u64 = 128;
+pub const COMMIT_REVEAL_WINDOW_SLOTS: u64 = 300;
 
 /// Recommended launch non-refundable commit fee (0.002 SOL). The actual value
 /// charged is governed by `ArenaRegistry::commit_fee_lamports`.

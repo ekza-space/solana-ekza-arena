@@ -81,16 +81,18 @@ pub const CHAR_RECORD_SEED: &[u8] = b"char_record_v1";
 pub const PAIR_COOLDOWN_SEED: &[u8] = b"pair_cd_v1";
 
 /// Slots between `commit_challenge` and the earliest `resolve_challenge`. The
-/// target slot's hash (unknown at commit) seeds the fight — revert-grind
-/// resistant, mirrors the mint commit/reveal path (`solana-ekza-arena`).
+/// first produced slot hash at/after the target (unknown at commit) seeds the
+/// fight — skip-safe and revert-grind resistant, mirroring the mint path.
 #[constant]
 pub const PVP_REVEAL_DELAY_SLOTS: u64 = 5;
 
 /// Lifetime of a committed challenge after its target slot. Past this, the
-/// target slot's hash has aged out of SlotHashes; `close_expired_challenge`
+/// canonical post-target hash has aged out of SlotHashes; `close_expired_challenge`
 /// reclaims the rent. Mirrors `COMMIT_REVEAL_WINDOW_SLOTS`.
 #[constant]
-pub const PVP_COMMIT_WINDOW_SLOTS: u64 = 128;
+/// Roughly two minutes for an external-wallet resolve approval while the
+/// target hash remains comfortably inside SlotHashes retention.
+pub const PVP_COMMIT_WINDOW_SLOTS: u64 = 300;
 
 /// Elo K-factor for the opponent-scaled PvP rating delta (design §4).
 pub const PVP_ELO_K: i32 = 24;

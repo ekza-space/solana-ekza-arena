@@ -5,6 +5,7 @@ pub mod affix;
 pub mod constants;
 pub mod contexts;
 pub mod error;
+pub mod fighter;
 pub mod handlers;
 pub mod state;
 pub mod utils;
@@ -76,6 +77,14 @@ pub mod solana_ekza_arena {
         handlers::reveal_mint(ctx, nonce)
     }
 
+    /// Commit-reveal fighter mint — consumes the same already-paid
+    /// `MintCommit` as `reveal_mint`, but writes a mint-keyed
+    /// `ArenaAssetData { card_kind: Avatar }` proof PDA with canonical rolled
+    /// combat stats. The exact EKZAF0..3 symbol binds the faction.
+    pub fn reveal_avatar_mint(ctx: Context<RevealAvatarMint>, nonce: u64) -> Result<()> {
+        handlers::reveal_avatar_mint(ctx, nonce)
+    }
+
     /// Permissionlessly close an expired commit; PDA rent always returns to
     /// the original minter, never to the cleanup caller.
     pub fn close_expired_commit(ctx: Context<CloseExpiredCommit>, nonce: u64) -> Result<()> {
@@ -88,6 +97,16 @@ pub mod solana_ekza_arena {
         args: CreatePlayerAvatarArgs,
     ) -> Result<()> {
         handlers::create_player_avatar(ctx, args)
+    }
+
+    /// Create or switch the player's active P3 fighter while proving current
+    /// ownership of its canonical 1/1 NFT. Clears both legacy and v2 equipment
+    /// atomically so no loadout leaks across fighters.
+    pub fn activate_fighter_v2(
+        ctx: Context<ActivateFighterV2>,
+        args: ActivateFighterV2Args,
+    ) -> Result<()> {
+        handlers::activate_fighter_v2(ctx, args)
     }
 
     /// Rename / reskin the character, or swap its base Avatar card.

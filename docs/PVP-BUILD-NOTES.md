@@ -41,7 +41,7 @@ Program: `programs/arena-leaderboard`. Devnet only. No deploy. No commit.
   scale 1e6, linear interp, symmetric for negative diff), diff clamped [-800,800].
 - `MIN_RANKED_GAMES = 3` (heap/matchmaking gate on the PvP path).
 - `PAIR_COOLDOWN_SLOTS = 150`, `MAX_RANKED_PER_PAIR_PER_DAY = 5` (repeat pair => exhibition).
-- `PVP_REVEAL_DELAY_SLOTS = 5`, `PVP_COMMIT_WINDOW_SLOTS = 128` (mirror mint).
+- `PVP_REVEAL_DELAY_SLOTS = 5`, `PVP_COMMIT_WINDOW_SLOTS = 300` (mirror mint).
 - Exhibition (cooldown-exceeded) fights: update W/L + CharRecord, NO rating, NO heap.
 
 ## New PDAs (seeds -> fields)

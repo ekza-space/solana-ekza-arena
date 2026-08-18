@@ -36,7 +36,9 @@ pub enum ArenaRegistryError {
     NotNftHolder,
     #[msg("Reveal attempted before the committed target slot has passed.")]
     RevealTooEarly,
-    #[msg("The committed target slot's hash is no longer in the SlotHashes sysvar.")]
+    #[msg(
+        "The canonical slot hash at/after the committed target is not provable from SlotHashes."
+    )]
     SlotHashNotFound,
     #[msg("The committed reveal window has expired.")]
     RevealWindowExpired,
@@ -82,4 +84,22 @@ pub enum ArenaRegistryError {
     NotScrollHolder,
     #[msg("The item is currently equipped; unequip it before enhancing.")]
     ItemEquipped,
+    #[msg("Playable fighter symbol must be exactly EKZAF0, EKZAF1, EKZAF2, or EKZAF3.")]
+    InvalidFighterSymbol,
+    #[msg("The mint commitment is not a valid playable-fighter intent.")]
+    InvalidFighterCommit,
+    #[msg("Invalid playable-fighter NFT name or metadata URI.")]
+    InvalidFighterMetadata,
+    #[msg("EKZAF0..3 are reserved for reveal_avatar_mint and cannot be revealed as gear.")]
+    FighterSymbolReserved,
+    #[msg("The signer is not the current holder of the fighter NFT.")]
+    NotFighterHolder,
+    #[msg("The supplied fighter mint is not a canonical 1/1 Arena fighter NFT.")]
+    InvalidFighterMint,
+    #[msg("The supplied minted-fighter Avatar PDA is invalid.")]
+    InvalidFighterAvatar,
+    #[msg("The v2 equipment record identity is invalid.")]
+    InvalidEquipmentRecord,
+    #[msg("Protocol-minted fighters must be selected through activate_fighter_v2.")]
+    FighterActivationRequired,
 }

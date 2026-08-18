@@ -51,11 +51,17 @@ const decodeMetadataEconomics = (data: Buffer) => {
   let offset = 1 + 32 + 32; // key + update_authority + mint
   const readString = () => {
     const length = data.readUInt32LE(offset);
-    offset += 4 + length;
+    offset += 4;
+    const value = data
+      .subarray(offset, offset + length)
+      .toString("utf8")
+      .replace(/\0+$/g, "");
+    offset += length;
+    return value;
   };
-  readString(); // name
-  readString(); // symbol
-  readString(); // uri
+  const name = readString();
+  const symbol = readString();
+  const uri = readString();
   const sellerFeeBasisPoints = data.readUInt16LE(offset);
   offset += 2;
   const hasCreators = data.readUInt8(offset++);
@@ -77,7 +83,7 @@ const decodeMetadataEconomics = (data: Buffer) => {
       creators.push({ address, verified, share });
     }
   }
-  return { sellerFeeBasisPoints, creators };
+  return { name, symbol, uri, sellerFeeBasisPoints, creators };
 };
 
 describe("solana-ekza-arena", () => {
@@ -123,6 +129,14 @@ describe("solana-ekza-arena", () => {
       program.programId
     )[0];
 
+  // Hardened playable-fighter proof PDA. A naked EKZAF metadata symbol is not
+  // authoritative unless this program-owned account exists for the NFT mint.
+  const arenaAvatarPda = (mint: anchor.web3.PublicKey) =>
+    anchor.web3.PublicKey.findProgramAddressSync(
+      [Buffer.from("arena_avatar_v1"), mint.toBuffer()],
+      program.programId
+    )[0];
+
   // v4 (spec §12.1): MintCommit PDA = [mint_commit, minter, nonce_le].
   const mintCommitPda = (minter: anchor.web3.PublicKey, nonce: number) =>
     anchor.web3.PublicKey.findProgramAddressSync(
@@ -140,7 +154,7 @@ describe("solana-ekza-arena", () => {
   const CREATOR_FEE_LAMPORTS = 1_000_000;
   const PLATFORM_FEE_LAMPORTS = 800_000;
   const SINK_FEE_LAMPORTS = 200_000;
-  const COMMIT_REVEAL_WINDOW_SLOTS = 128;
+  const COMMIT_REVEAL_WINDOW_SLOTS = 300;
   let nextCommitNonce = Date.now();
 
   const waitForSlotAfter = async (target: number) => {
@@ -154,6 +168,96 @@ describe("solana-ekza-arena", () => {
   const SLOT_HASHES_SYSVAR = new anchor.web3.PublicKey(
     "SysvarS1otHashes111111111111111111111111111"
   );
+
+  // Independent TS mirror of the small fighter roll contract. This does not
+  // read any program output while deriving expectations, so the E2E test pins
+  // actual Rust/TypeScript parity rather than merely asserting self-consistency.
+  const U64_MASK = (1n << 64n) - 1n;
+  const splitmix64Next = (state: bigint): [bigint, bigint] => {
+    const nextState = (state + 0x9e3779b97f4a7c15n) & U64_MASK;
+    let z = nextState;
+    z = ((z ^ (z >> 30n)) * 0xbf58476d1ce4e5b9n) & U64_MASK;
+    z = ((z ^ (z >> 27n)) * 0x94d049bb133111ebn) & U64_MASK;
+    return [(z ^ (z >> 31n)) & U64_MASK, nextState];
+  };
+  const splitmix64Mix = (value: bigint): bigint => splitmix64Next(value)[0];
+
+  const slotHashFirst8 = async (targetSlot: number): Promise<bigint> => {
+    const info = await provider.connection.getAccountInfo(SLOT_HASHES_SYSVAR);
+    if (!info) throw new Error("SlotHashes sysvar is unavailable");
+    const length = Number(info.data.readBigUInt64LE(0));
+    let candidate: bigint | null = null;
+    for (let i = 0; i < length; i += 1) {
+      const offset = 8 + i * 40;
+      const producedSlot = Number(info.data.readBigUInt64LE(offset));
+      if (producedSlot === targetSlot) {
+        return info.data.readBigUInt64LE(offset + 8);
+      }
+      if (producedSlot > targetSlot) {
+        candidate = info.data.readBigUInt64LE(offset + 8);
+      } else if (candidate !== null) {
+        return candidate;
+      } else {
+        break;
+      }
+    }
+    throw new Error(
+      `first produced slot at/after ${targetSlot} is not provable from SlotHashes`
+    );
+  };
+
+  const rollFighterTs = (seed: bigint, faction: number) => {
+    const bases = [
+      { hp: 11, attack: 1, armor: 1, speed: 0 },
+      { hp: 9, attack: 3, armor: 0, speed: 1 },
+      { hp: 9, attack: 2, armor: 0, speed: 2 },
+      { hp: 11, attack: 2, armor: 1, speed: 0 },
+    ];
+    const defaultSkills = [
+      "moss_skin",
+      "fire_opener",
+      "quickstep",
+      "stone_oath",
+    ];
+    const bonusSkills = [
+      "heavy_guard",
+      "glass_cannon",
+      "jewelry_focus",
+      "heavy_guard",
+    ];
+    const rarityWeights = [600, 280, 90, 29, 1];
+    const tiers = [1, 2, 3, 4, 5];
+    let state = seed & U64_MASK;
+    const next = () => {
+      const [value, nextState] = splitmix64Next(state);
+      state = nextState;
+      return value;
+    };
+    let rarityRoll = Number(next() % 1000n);
+    let rarity = rarityWeights.length - 1;
+    for (let i = 0; i < rarityWeights.length; i += 1) {
+      if (rarityRoll < rarityWeights[i]) {
+        rarity = i;
+        break;
+      }
+      rarityRoll -= rarityWeights[i];
+    }
+    const tier = tiers[rarity];
+    const range = (hi: number) => Number(next() % BigInt(hi + 1));
+    const hpBump = range(tier);
+    const primaryBump = range(tier);
+    const powerBump = tier >= 3 ? range(1) : 0;
+    const stats = { ...bases[faction] };
+    stats.hp += hpBump;
+    stats.attack += powerBump;
+    if (faction === 0) stats.hp += primaryBump;
+    if (faction === 1) stats.attack += primaryBump;
+    if (faction === 2) stats.speed += primaryBump;
+    if (faction === 3) stats.armor += primaryBump;
+    const skillIds = [defaultSkills[faction]];
+    if (rarity >= 2) skillIds.push(bonusSkills[faction]);
+    return { stats, rarity, tier, skillIds };
+  };
 
   const stellarRegistryPda = () =>
     anchor.web3.PublicKey.findProgramAddressSync(
@@ -673,7 +777,9 @@ describe("solana-ekza-arena", () => {
           systemProgram: anchor.web3.SystemProgram.programId,
         })
         .rpc();
-      expect.fail("commitMint should reject a destination below rent exemption");
+      expect.fail(
+        "commitMint should reject a destination below rent exemption"
+      );
     } catch (error) {
       expect(String(error)).to.include("fee destination must already exist");
     }
@@ -1412,6 +1518,293 @@ describe("solana-ekza-arena", () => {
     console.log("E2E_PROOF reveal_commit_closed=" + commitPda.toBase58());
   });
 
+  it("commit_mint binds a canonical fighter to the Charm carrier before charging", async () => {
+    const minter = provider.wallet.publicKey;
+    const nonce = nextCommitNonce++;
+    const commitPda = mintCommitPda(minter, nonce);
+    const treasuryBefore = await provider.connection.getBalance(
+      treasury.publicKey
+    );
+    const sinkBefore = await provider.connection.getBalance(sink.publicKey);
+    try {
+      await program.methods
+        .commitMint({
+          nonce: new anchor.BN(nonce),
+          baseType: { weapon: {} },
+          skin: { builtin: [10] },
+          name: "Fake Fighter Weapon",
+          symbol: "EKZAF0",
+          uri: "https://meta.ekza.space/arena/fake-fighter.json",
+        })
+        .accountsStrict({
+          registry: registryPda(),
+          mintCommit: commitPda,
+          minter,
+          treasury: treasury.publicKey,
+          sink: sink.publicKey,
+          stellarProgram: null,
+          stellarRelease: null,
+          stellarVault: null,
+          systemProgram: anchor.web3.SystemProgram.programId,
+        })
+        .rpc();
+      expect.fail("canonical fighter symbols must require the Charm carrier");
+    } catch (error) {
+      expect(String(error)).to.include("valid playable-fighter intent");
+    }
+    expect(await provider.connection.getAccountInfo(commitPda)).to.equal(null);
+    expect(await provider.connection.getBalance(treasury.publicKey)).to.equal(
+      treasuryBefore
+    );
+    expect(await provider.connection.getBalance(sink.publicKey)).to.equal(
+      sinkBefore
+    );
+    console.log("E2E_PROOF fighter_intent_bound_before_fee=true");
+  });
+
+  it("reveal_avatar_mint rejects a legacy/prefix-only EKZAF symbol (anti-spoof)", async () => {
+    const minter = provider.wallet.publicKey;
+    const nonce = nextCommitNonce++;
+    const commitPda = mintCommitPda(minter, nonce);
+
+    await program.methods
+      .commitMint({
+        nonce: new anchor.BN(nonce),
+        baseType: { charm: {} },
+        skin: { builtin: [10] },
+        name: "Legacy Fighter",
+        // Previously accepted by the web's prefix heuristic. It is not a
+        // canonical faction-bound protocol fighter symbol.
+        symbol: "EKZAFTR",
+        uri: "https://meta.ekza.space/arena/legacy-fighter.json",
+      })
+      .accountsStrict({
+        registry: registryPda(),
+        mintCommit: commitPda,
+        minter,
+        treasury: treasury.publicKey,
+        sink: sink.publicKey,
+        stellarProgram: null,
+        stellarRelease: null,
+        stellarVault: null,
+        systemProgram: anchor.web3.SystemProgram.programId,
+      })
+      .rpc();
+
+    const commit = await program.account.mintCommit.fetch(commitPda);
+    await waitForSlotAfter(commit.targetSlot.toNumber());
+    const mint = anchor.web3.Keypair.generate();
+    const avatarAsset = arenaAvatarPda(mint.publicKey);
+    try {
+      await program.methods
+        .revealAvatarMint(new anchor.BN(nonce))
+        .accountsStrict({
+          registry: registryPda(),
+          mintCommit: commitPda,
+          mint: mint.publicKey,
+          avatarAsset,
+          minterTokenAccount: getAssociatedTokenAddressSync(
+            mint.publicKey,
+            minter
+          ),
+          minter,
+          slotHashes: SLOT_HASHES_SYSVAR,
+          metadataAccount: metadataPda(mint.publicKey),
+          masterEdition: masterEditionPda(mint.publicKey),
+          stellarProgram: null,
+          stellarRelease: null,
+          stellarVault: null,
+          tokenMetadataProgram: TOKEN_METADATA_PROGRAM_ID,
+          tokenProgram: TOKEN_PROGRAM_ID,
+          associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+          systemProgram: anchor.web3.SystemProgram.programId,
+          rent: anchor.web3.SYSVAR_RENT_PUBKEY,
+        })
+        .signers([mint])
+        .rpc();
+      expect.fail("legacy EKZAFTR must not authenticate as a fighter");
+    } catch (error) {
+      expect(String(error)).to.include("exactly EKZAF0");
+    }
+
+    // Failed reveal is atomic: neither a mint nor a forged proof PDA exists,
+    // and the paid commitment is still available for expiry cleanup.
+    expect(await provider.connection.getAccountInfo(mint.publicKey)).to.equal(
+      null
+    );
+    expect(await provider.connection.getAccountInfo(avatarAsset)).to.equal(
+      null
+    );
+    expect(await provider.connection.getAccountInfo(commitPda)).to.not.equal(
+      null
+    );
+    console.log("E2E_PROOF fighter_symbol_spoof_rejected=true");
+  });
+
+  it("reveal_avatar_mint stores the exact TS-derived fighter stats in its mint-keyed PDA", async () => {
+    const minter = provider.wallet.publicKey;
+    const nonce = nextCommitNonce++;
+    const commitPda = mintCommitPda(minter, nonce);
+    const name = "Spark Fighter";
+    const symbol = "EKZAF1"; // canonical faction id: Spark
+    const uri = "https://meta.ekza.space/arena/spark-fighter.json";
+
+    await program.methods
+      .commitMint({
+        nonce: new anchor.BN(nonce),
+        baseType: { charm: {} },
+        skin: { builtin: [11] },
+        name,
+        symbol,
+        uri,
+      })
+      .accountsStrict({
+        registry: registryPda(),
+        mintCommit: commitPda,
+        minter,
+        treasury: treasury.publicKey,
+        sink: sink.publicKey,
+        stellarProgram: null,
+        stellarRelease: null,
+        stellarVault: null,
+        systemProgram: anchor.web3.SystemProgram.programId,
+      })
+      .rpc();
+
+    const commit = await program.account.mintCommit.fetch(commitPda);
+    const targetSlot = commit.targetSlot.toNumber();
+    await waitForSlotAfter(targetSlot);
+    const slotHash = await slotHashFirst8(targetSlot);
+    const minterFirst8 = Buffer.from(minter.toBytes()).readBigUInt64LE(0);
+    const commitFirst8 = Buffer.from(commitPda.toBytes()).readBigUInt64LE(0);
+    const seed = splitmix64Mix(slotHash ^ minterFirst8 ^ commitFirst8);
+    const expected = rollFighterTs(seed, 1);
+
+    // The same canonical EKZAF commit cannot be diverted into generic gear.
+    // That would create symbol-marked metadata without the avatar proof PDA.
+    const fakeGearMint = anchor.web3.Keypair.generate();
+    const fakeArenaItem = arenaItemPda(fakeGearMint.publicKey);
+    try {
+      await program.methods
+        .revealMint(new anchor.BN(nonce))
+        .accountsStrict({
+          registry: registryPda(),
+          mintCommit: commitPda,
+          mint: fakeGearMint.publicKey,
+          arenaItem: fakeArenaItem,
+          minterTokenAccount: getAssociatedTokenAddressSync(
+            fakeGearMint.publicKey,
+            minter
+          ),
+          minter,
+          slotHashes: SLOT_HASHES_SYSVAR,
+          metadataAccount: metadataPda(fakeGearMint.publicKey),
+          masterEdition: masterEditionPda(fakeGearMint.publicKey),
+          stellarProgram: null,
+          stellarRelease: null,
+          stellarVault: null,
+          tokenMetadataProgram: TOKEN_METADATA_PROGRAM_ID,
+          tokenProgram: TOKEN_PROGRAM_ID,
+          associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+          systemProgram: anchor.web3.SystemProgram.programId,
+          rent: anchor.web3.SYSVAR_RENT_PUBKEY,
+        })
+        .signers([fakeGearMint])
+        .rpc();
+      expect.fail("EKZAF1 must be reserved from the generic gear reveal");
+    } catch (error) {
+      expect(String(error)).to.include("reserved for reveal_avatar_mint");
+    }
+    expect(
+      await provider.connection.getAccountInfo(fakeGearMint.publicKey)
+    ).to.equal(null);
+    expect(await provider.connection.getAccountInfo(fakeArenaItem)).to.equal(
+      null
+    );
+    expect(await provider.connection.getAccountInfo(commitPda)).to.not.equal(
+      null
+    );
+
+    const mint = anchor.web3.Keypair.generate();
+    const avatarAsset = arenaAvatarPda(mint.publicKey);
+    const ata = getAssociatedTokenAddressSync(mint.publicKey, minter);
+    await program.methods
+      .revealAvatarMint(new anchor.BN(nonce))
+      .accountsStrict({
+        registry: registryPda(),
+        mintCommit: commitPda,
+        mint: mint.publicKey,
+        avatarAsset,
+        minterTokenAccount: ata,
+        minter,
+        slotHashes: SLOT_HASHES_SYSVAR,
+        metadataAccount: metadataPda(mint.publicKey),
+        masterEdition: masterEditionPda(mint.publicKey),
+        stellarProgram: null,
+        stellarRelease: null,
+        stellarVault: null,
+        tokenMetadataProgram: TOKEN_METADATA_PROGRAM_ID,
+        tokenProgram: TOKEN_PROGRAM_ID,
+        associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+        systemProgram: anchor.web3.SystemProgram.programId,
+        rent: anchor.web3.SYSVAR_RENT_PUBKEY,
+      })
+      .signers([mint])
+      .rpc();
+
+    const mintInfo = await getMint(provider.connection, mint.publicKey);
+    expect(mintInfo.supply.toString()).to.equal("1");
+    expect(mintInfo.decimals).to.equal(0);
+    expect(
+      (await getAccount(provider.connection, ata)).amount.toString()
+    ).to.equal("1");
+
+    const asset = await program.account.arenaAssetData.fetch(avatarAsset);
+    expect(asset.cardKind).to.deep.equal({ avatar: {} });
+    expect(asset.baseStats).to.deep.equal(expected.stats);
+    expect(asset.statDelta).to.deep.equal({
+      hp: 0,
+      attack: 0,
+      armor: 0,
+      speed: 0,
+    });
+    expect(asset.slotMask).to.equal(15);
+    const rarityVariants = [
+      { common: {} },
+      { rare: {} },
+      { epic: {} },
+      { legendary: {} },
+      { mythic: {} },
+    ];
+    expect(asset.rarity).to.deep.equal(rarityVariants[expected.rarity]);
+    expect(asset.element).to.deep.equal({ none: {} });
+    expect(asset.skillIds).to.deep.equal(expected.skillIds);
+    expect(asset.skinRef).to.deep.equal({ builtin: { "0": 11 } });
+    expect(asset.creator.toBase58()).to.equal(treasury.publicKey.toBase58());
+    expect(asset.metadataIpfsHash).to.equal(uri);
+    expect(asset.archetypeId).to.equal(`fighter:${mint.publicKey.toBase58()}`);
+
+    const metadata = decodeMetadataEconomics(
+      (await provider.connection.getAccountInfo(metadataPda(mint.publicKey)))!
+        .data
+    );
+    expect(metadata.name).to.equal(name);
+    expect(metadata.symbol).to.equal(symbol);
+    expect(metadata.uri).to.equal(uri);
+    expect(metadata.sellerFeeBasisPoints).to.equal(500);
+
+    // Authentic fighters have the avatar proof and no ArenaItem gear PDA.
+    expect(await provider.connection.getAccountInfo(avatarAsset)).to.not.equal(
+      null
+    );
+    expect(
+      await provider.connection.getAccountInfo(arenaItemPda(mint.publicKey))
+    ).to.equal(null);
+    expect(await provider.connection.getAccountInfo(commitPda)).to.equal(null);
+    console.log("E2E_PROOF fighter_avatar_pda=" + avatarAsset.toBase58());
+    console.log("E2E_PROOF fighter_stats_ts_parity=true");
+  });
+
   it("permissionlessly closes an expired commit and returns rent only to its minter", async () => {
     const minter = anchor.web3.Keypair.generate();
     const closer = anchor.web3.Keypair.generate();
@@ -1588,6 +1981,71 @@ describe("solana-ekza-arena", () => {
       );
       await provider.sendAndConfirm(tx);
       return { mint, ata: destAta, arenaItem: arenaItemPda(mint) };
+    };
+
+    const mintFighterTo = async (
+      owner: anchor.web3.Keypair,
+      symbol: "EKZAF0" | "EKZAF1" | "EKZAF2" | "EKZAF3"
+    ) => {
+      const nonce = nextCommitNonce++;
+      const commit = mintCommitPda(owner.publicKey, nonce);
+      await program.methods
+        .commitMint({
+          nonce: new anchor.BN(nonce),
+          baseType: { charm: {} },
+          skin: { builtin: [12] },
+          name: "Activation Fighter",
+          symbol,
+          uri: "https://meta.ekza.space/arena/activation-fighter.json",
+        })
+        .accountsStrict({
+          registry: registryPda(),
+          mintCommit: commit,
+          minter: owner.publicKey,
+          treasury: treasury.publicKey,
+          sink: sink.publicKey,
+          stellarProgram: null,
+          stellarRelease: null,
+          stellarVault: null,
+          systemProgram: anchor.web3.SystemProgram.programId,
+        })
+        .signers([owner])
+        .rpc();
+
+      const pending = await program.account.mintCommit.fetch(commit);
+      await waitForSlotAfter(pending.targetSlot.toNumber());
+
+      const mint = anchor.web3.Keypair.generate();
+      const ata = getAssociatedTokenAddressSync(
+        mint.publicKey,
+        owner.publicKey
+      );
+      const avatarAsset = arenaAvatarPda(mint.publicKey);
+      await program.methods
+        .revealAvatarMint(new anchor.BN(nonce))
+        .accountsStrict({
+          registry: registryPda(),
+          mintCommit: commit,
+          mint: mint.publicKey,
+          avatarAsset,
+          minterTokenAccount: ata,
+          minter: owner.publicKey,
+          slotHashes: SLOT_HASHES_SYSVAR,
+          metadataAccount: metadataPda(mint.publicKey),
+          masterEdition: masterEditionPda(mint.publicKey),
+          stellarProgram: null,
+          stellarRelease: null,
+          stellarVault: null,
+          tokenMetadataProgram: TOKEN_METADATA_PROGRAM_ID,
+          tokenProgram: TOKEN_PROGRAM_ID,
+          associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+          systemProgram: anchor.web3.SystemProgram.programId,
+          rent: anchor.web3.SYSVAR_RENT_PUBKEY,
+        })
+        .signers([mint, owner])
+        .rpc();
+
+      return { mint: mint.publicKey, ata, avatarAsset };
     };
 
     const equip = (
@@ -1956,6 +2414,57 @@ describe("solana-ekza-arena", () => {
         );
       });
 
+      it("equip_item_v2 moves one mint instead of duplicating it across compatible slots", async () => {
+        const armor = await mintItemTo(
+          avatarOwner,
+          { armor: {} },
+          "Moving Plate"
+        );
+
+        await equipV2(avatarOwner, armor, SLOT.Body);
+        await equipV2(avatarOwner, armor, SLOT.Gloves);
+
+        let record = await program.account.equipmentRecord.fetch(
+          equipmentPda(avatarOwner.publicKey)
+        );
+        expect(
+          record.slots.slice(0, 7).filter((mint) => mint.equals(armor.mint))
+            .length
+        ).to.equal(1);
+        expect(
+          record.slots[SLOT.Body].equals(anchor.web3.PublicKey.default)
+        ).to.equal(true);
+        expect(record.slots[SLOT.Gloves].equals(armor.mint)).to.equal(true);
+
+        // Gloves has no legacy mirror, so moving away from canonical Body must
+        // clear the old PlayerAvatar.equipped[Armor] occurrence as well.
+        let avatar = await program.account.playerAvatar.fetch(
+          playerAvatarPda(avatarOwner.publicKey)
+        );
+        expect(
+          avatar.equipped[2].equals(anchor.web3.PublicKey.default)
+        ).to.equal(true);
+
+        await equipV2(avatarOwner, armor, SLOT.Body);
+        record = await program.account.equipmentRecord.fetch(
+          equipmentPda(avatarOwner.publicKey)
+        );
+        expect(
+          record.slots.slice(0, 7).filter((mint) => mint.equals(armor.mint))
+            .length
+        ).to.equal(1);
+        expect(record.slots[SLOT.Body].equals(armor.mint)).to.equal(true);
+        expect(
+          record.slots[SLOT.Gloves].equals(anchor.web3.PublicKey.default)
+        ).to.equal(true);
+
+        avatar = await program.account.playerAvatar.fetch(
+          playerAvatarPda(avatarOwner.publicKey)
+        );
+        expect(avatar.equipped[2].equals(armor.mint)).to.equal(true);
+        console.log("E2E_PROOF equipment_v2_one_mint_one_slot=true");
+      });
+
       it("rejects a base-type/slot mismatch (Weapon into Head, Armor into Ring)", async () => {
         const weapon = await mintItemTo(avatarOwner, { weapon: {} }, "Bad Fit");
         try {
@@ -2072,6 +2581,180 @@ describe("solana-ekza-arena", () => {
         }
         console.log("E2E_PROOF equipment_v2_unequip=true");
       });
+
+      it("activate_fighter_v2 proves the holder, clears equipment, and supports swap + create", async () => {
+        const fighter = await mintFighterTo(avatarOwner, "EKZAF2");
+        const freshOwner = anchor.web3.Keypair.generate();
+        const freshAta = getAssociatedTokenAddressSync(
+          fighter.mint,
+          freshOwner.publicKey
+        );
+        const freshPlayerAvatar = playerAvatarPda(freshOwner.publicKey);
+        const freshEquipment = equipmentPda(freshOwner.publicKey);
+
+        // Even the current holder cannot route a mint-keyed fighter proof
+        // through the legacy swap instruction, because that ABI carries no
+        // mint/ATA accounts and would also admit a non-holder.
+        try {
+          await program.methods
+            .customizeAvatar({ name: null, skin: null })
+            .accountsStrict({
+              playerAvatar: playerAvatarPda(avatarOwner.publicKey),
+              newAvatarAsset: fighter.avatarAsset,
+              owner: avatarOwner.publicKey,
+            })
+            .signers([avatarOwner])
+            .rpc();
+          expect.fail("customizeAvatar must not select a minted fighter");
+        } catch (error) {
+          expect(String(error)).to.include("through activate_fighter_v2");
+        }
+
+        await provider.sendAndConfirm(
+          new anchor.web3.Transaction().add(
+            anchor.web3.SystemProgram.transfer({
+              fromPubkey: provider.wallet.publicKey,
+              toPubkey: freshOwner.publicKey,
+              lamports: anchor.web3.LAMPORTS_PER_SOL,
+            }),
+            createAssociatedTokenAccountInstruction(
+              provider.wallet.publicKey,
+              freshAta,
+              freshOwner.publicKey,
+              fighter.mint
+            )
+          )
+        );
+
+        try {
+          await program.methods
+            .createPlayerAvatar({ name: "Legacy Fighter Spoof" })
+            .accountsStrict({
+              playerAvatar: freshPlayerAvatar,
+              avatarAsset: fighter.avatarAsset,
+              owner: freshOwner.publicKey,
+              systemProgram: anchor.web3.SystemProgram.programId,
+            })
+            .signers([freshOwner])
+            .rpc();
+          expect.fail("createPlayerAvatar must not select a minted fighter");
+        } catch (error) {
+          expect(String(error)).to.include("through activate_fighter_v2");
+        }
+        expect(
+          await provider.connection.getAccountInfo(freshPlayerAvatar)
+        ).to.equal(null);
+
+        // Merely owning an empty ATA is not enough. Account creation is
+        // transaction-atomic, so the failed attempt must leave no partial
+        // PlayerAvatar or EquipmentRecord behind.
+        try {
+          await program.methods
+            .activateFighterV2({ name: "Zero Balance Spoof" })
+            .accountsStrict({
+              playerAvatar: freshPlayerAvatar,
+              avatarAsset: fighter.avatarAsset,
+              fighterMint: fighter.mint,
+              fighterTokenAccount: freshAta,
+              equipmentRecord: freshEquipment,
+              owner: freshOwner.publicKey,
+              systemProgram: anchor.web3.SystemProgram.programId,
+            })
+            .signers([freshOwner])
+            .rpc();
+          expect.fail("activateFighterV2 should reject an empty holder ATA");
+        } catch (error) {
+          expect(String(error)).to.include("not the current holder");
+        }
+        expect(
+          await provider.connection.getAccountInfo(freshPlayerAvatar)
+        ).to.equal(null);
+        expect(
+          await provider.connection.getAccountInfo(freshEquipment)
+        ).to.equal(null);
+
+        // avatarOwner already has both accounts and a non-empty loadout: this
+        // exercises the swap path and its atomic reset.
+        await program.methods
+          .activateFighterV2({ name: "Stone Activated" })
+          .accountsStrict({
+            playerAvatar: playerAvatarPda(avatarOwner.publicKey),
+            avatarAsset: fighter.avatarAsset,
+            fighterMint: fighter.mint,
+            fighterTokenAccount: fighter.ata,
+            equipmentRecord: equipmentPda(avatarOwner.publicKey),
+            owner: avatarOwner.publicKey,
+            systemProgram: anchor.web3.SystemProgram.programId,
+          })
+          .signers([avatarOwner])
+          .rpc();
+
+        const switchedAvatar = await program.account.playerAvatar.fetch(
+          playerAvatarPda(avatarOwner.publicKey)
+        );
+        expect(switchedAvatar.avatarAsset.equals(fighter.avatarAsset)).to.equal(
+          true
+        );
+        expect(switchedAvatar.name).to.equal("Stone Activated");
+        expect(switchedAvatar.slotMask).to.equal(15);
+        for (const mint of switchedAvatar.equipped) {
+          expect(mint.equals(anchor.web3.PublicKey.default)).to.equal(true);
+        }
+        const clearedEquipment = await program.account.equipmentRecord.fetch(
+          equipmentPda(avatarOwner.publicKey)
+        );
+        for (const mint of clearedEquipment.slots) {
+          expect(mint.equals(anchor.web3.PublicKey.default)).to.equal(true);
+        }
+
+        // After transfer, the same proof creates the new holder's two PDAs.
+        await provider.sendAndConfirm(
+          new anchor.web3.Transaction().add(
+            createTransferInstruction(
+              fighter.ata,
+              freshAta,
+              avatarOwner.publicKey,
+              1
+            )
+          ),
+          [avatarOwner]
+        );
+        await program.methods
+          .activateFighterV2({ name: "Stone Rehomed" })
+          .accountsStrict({
+            playerAvatar: freshPlayerAvatar,
+            avatarAsset: fighter.avatarAsset,
+            fighterMint: fighter.mint,
+            fighterTokenAccount: freshAta,
+            equipmentRecord: freshEquipment,
+            owner: freshOwner.publicKey,
+            systemProgram: anchor.web3.SystemProgram.programId,
+          })
+          .signers([freshOwner])
+          .rpc();
+
+        const createdAvatar = await program.account.playerAvatar.fetch(
+          freshPlayerAvatar
+        );
+        expect(createdAvatar.owner.equals(freshOwner.publicKey)).to.equal(true);
+        expect(createdAvatar.avatarAsset.equals(fighter.avatarAsset)).to.equal(
+          true
+        );
+        expect(createdAvatar.name).to.equal("Stone Rehomed");
+        const createdEquipment = await program.account.equipmentRecord.fetch(
+          freshEquipment
+        );
+        expect(createdEquipment.avatar.equals(freshPlayerAvatar)).to.equal(
+          true
+        );
+        expect(createdEquipment.owner.equals(freshOwner.publicKey)).to.equal(
+          true
+        );
+        for (const mint of createdEquipment.slots) {
+          expect(mint.equals(anchor.web3.PublicKey.default)).to.equal(true);
+        }
+        console.log("E2E_PROOF fighter_holder_gated_activation=true");
+      });
     });
   });
 
@@ -2117,10 +2800,7 @@ describe("solana-ekza-arena", () => {
     // commit_enhance requires them for the equipped-item guard.
     const providerAvatarPda = () =>
       anchor.web3.PublicKey.findProgramAddressSync(
-        [
-          Buffer.from("player_avatar_v1"),
-          provider.wallet.publicKey.toBuffer(),
-        ],
+        [Buffer.from("player_avatar_v1"), provider.wallet.publicKey.toBuffer()],
         program.programId
       )[0];
     const providerEquipmentPda = () =>
@@ -2138,21 +2818,30 @@ describe("solana-ekza-arena", () => {
       return (z ^ (z >> 31n)) & MASK64;
     };
 
-    // First 8 LE bytes of the SlotHashes entry for `slot` (fixed once
-    // written — the exact bytes reveal_enhance reads on-chain).
-    const slotHashFirst8 = async (slot: number): Promise<bigint> => {
-      const info = await provider.connection.getAccountInfo(
-        SLOT_HASHES_SYSVAR
-      );
+    // First 8 LE bytes of the earliest produced slot at/after the committed
+    // target (fixed once the lower SlotHashes boundary is visible).
+    const slotHashFirst8 = async (targetSlot: number): Promise<bigint> => {
+      const info = await provider.connection.getAccountInfo(SLOT_HASHES_SYSVAR);
       const data = info!.data;
       const len = Number(data.readBigUInt64LE(0));
+      let candidate: bigint | null = null;
       for (let i = 0; i < len; i++) {
         const base = 8 + i * 40;
-        if (Number(data.readBigUInt64LE(base)) === slot) {
+        const producedSlot = Number(data.readBigUInt64LE(base));
+        if (producedSlot === targetSlot) {
           return data.readBigUInt64LE(base + 8);
         }
+        if (producedSlot > targetSlot) {
+          candidate = data.readBigUInt64LE(base + 8);
+        } else if (candidate !== null) {
+          return candidate;
+        } else {
+          break;
+        }
       }
-      throw new Error(`slot hash for ${slot} aged out of the sysvar`);
+      throw new Error(
+        `first produced slot at/after ${targetSlot} is not provable from SlotHashes`
+      );
     };
 
     const expectedEnhanceSuccess = async (
@@ -2212,7 +2901,10 @@ describe("solana-ekza-arena", () => {
 
     const commitEnhance = (
       itemMint: anchor.web3.PublicKey,
-      scroll: { scrollMint: anchor.web3.PublicKey; scrollAta: anchor.web3.PublicKey },
+      scroll: {
+        scrollMint: anchor.web3.PublicKey;
+        scrollAta: anchor.web3.PublicKey;
+      },
       nonce: number
     ) => {
       const owner = provider.wallet.publicKey;
@@ -2298,11 +2990,12 @@ describe("solana-ekza-arena", () => {
       const nonce = nextCommitNonce++;
       const commit = enhanceCommitPda(owner, nonce);
 
-      const levelBefore = (
-        await program.account.itemEnhancement.fetchNullable(
-          enhancementPda(itemMint)
-        )
-      )?.level ?? 0;
+      const levelBefore =
+        (
+          await program.account.itemEnhancement.fetchNullable(
+            enhancementPda(itemMint)
+          )
+        )?.level ?? 0;
 
       await commitEnhance(itemMint, scroll, nonce);
       const pending = await program.account.enhanceCommit.fetch(commit);
@@ -2580,7 +3273,9 @@ describe("solana-ekza-arena", () => {
 
       // Scroll escrowed: the owner's ATA is empty while the commit is open.
       expect(
-        (await getAccount(provider.connection, scroll.scrollAta)).amount.toString()
+        (
+          await getAccount(provider.connection, scroll.scrollAta)
+        ).amount.toString()
       ).to.equal("0");
 
       const closer = anchor.web3.Keypair.generate();
@@ -2636,7 +3331,9 @@ describe("solana-ekza-arena", () => {
       );
       expect(burnedScroll.supply.toString()).to.equal("0");
       expect(
-        (await getAccount(provider.connection, scroll.scrollAta)).amount.toString()
+        (
+          await getAccount(provider.connection, scroll.scrollAta)
+        ).amount.toString()
       ).to.equal("0");
       expect(
         await provider.connection.getAccountInfo(

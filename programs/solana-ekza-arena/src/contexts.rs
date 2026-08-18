@@ -7,17 +7,17 @@ use anchor_spl::{
 
 use crate::{
     constants::{
-        ARENA_ASSET_SEED, ARENA_ITEM_SEED, ENHANCEMENT_SEED, ENHANCE_COMMIT_SEED, EQUIPMENT_SEED,
-        MINT_COMMIT_SEED, PLAYER_AVATAR_SEED, REGISTRY_SEED, SCROLL_SEED, STELLAR_LINK_SEED,
-        STELLAR_RELEASE_LINK_SEED,
+        ARENA_ASSET_SEED, ARENA_AVATAR_SEED, ARENA_ITEM_SEED, ENHANCEMENT_SEED,
+        ENHANCE_COMMIT_SEED, EQUIPMENT_SEED, MINT_COMMIT_SEED, PLAYER_AVATAR_SEED, REGISTRY_SEED,
+        SCROLL_SEED, STELLAR_LINK_SEED, STELLAR_RELEASE_LINK_SEED,
     },
     error::ArenaRegistryError,
     state::{
-        ArenaAssetData, ArenaItem, ArenaRegistry, CommitMintArgs, ConfigureRegistryArgs,
-        CreatePlayerAvatarArgs, CustomizeAvatarArgs, EnhanceCommit, EnhanceScrollMarker,
-        EquipmentRecord, ItemEnhancement, MintArenaItemArgs, MintCommit, MintEnhanceScrollArgs,
-        PlayerAvatar, RegisterArenaAssetArgs, RegisterArenaAssetFromStellarArgs,
-        StellarArenaAssetLink, StellarReleaseLink,
+        ActivateFighterV2Args, ArenaAssetData, ArenaItem, ArenaRegistry, CommitMintArgs,
+        ConfigureRegistryArgs, CreatePlayerAvatarArgs, CustomizeAvatarArgs, EnhanceCommit,
+        EnhanceScrollMarker, EquipmentRecord, ItemEnhancement, MintArenaItemArgs, MintCommit,
+        MintEnhanceScrollArgs, PlayerAvatar, RegisterArenaAssetArgs,
+        RegisterArenaAssetFromStellarArgs, StellarArenaAssetLink, StellarReleaseLink,
     },
 };
 
@@ -281,6 +281,74 @@ pub struct CreatePlayerAvatar<'info> {
     pub system_program: Program<'info, System>,
 }
 
+/// Holder-gated activation for a protocol-minted fighter. Unlike the legacy
+/// catalog-card create/customize paths, this proves all three identities in
+/// one transaction: canonical `[ARENA_AVATAR_SEED, mint]` Avatar PDA, canonical
+/// 1/1 mint, and the owner's ATA holding its token. It supports both first
+/// activation and swapping an existing `PlayerAvatar` without changing either
+/// legacy instruction ABI.
+#[derive(Accounts)]
+#[instruction(args: ActivateFighterV2Args)]
+pub struct ActivateFighterV2<'info> {
+    #[account(
+        init_if_needed,
+        payer = owner,
+        space = 8 + PlayerAvatar::INIT_SPACE,
+        seeds = [PLAYER_AVATAR_SEED, owner.key().as_ref()],
+        bump,
+        constraint = player_avatar.owner == Pubkey::default()
+            || player_avatar.owner == owner.key() @ ArenaRegistryError::Unauthorized,
+    )]
+    pub player_avatar: Account<'info, PlayerAvatar>,
+
+    /// Program-owned authenticity/stats proof bound 1:1 to `fighter_mint`.
+    #[account(
+        seeds = [ARENA_AVATAR_SEED, fighter_mint.key().as_ref()],
+        bump = avatar_asset.bump,
+        constraint = avatar_asset.card_kind == crate::state::ArenaCardKind::Avatar
+            @ ArenaRegistryError::InvalidFighterAvatar,
+    )]
+    pub avatar_asset: Account<'info, ArenaAssetData>,
+
+    #[account(
+        constraint = fighter_mint.decimals == 0 @ ArenaRegistryError::InvalidFighterMint,
+        constraint = fighter_mint.supply == 1 @ ArenaRegistryError::InvalidFighterMint,
+    )]
+    pub fighter_mint: Account<'info, Mint>,
+
+    /// Current holder proof. An ATA with zero balance fails explicitly; an ATA
+    /// belonging to another wallet/mint fails Anchor's associated constraints.
+    #[account(
+        associated_token::mint = fighter_mint,
+        associated_token::authority = owner,
+        constraint = fighter_token_account.amount == 1
+            @ ArenaRegistryError::NotFighterHolder,
+    )]
+    pub fighter_token_account: Account<'info, TokenAccount>,
+
+    /// Created on first activation if needed. Every activation atomically
+    /// clears all 16 slots so equipment from the previous fighter cannot leak.
+    #[account(
+        init_if_needed,
+        payer = owner,
+        space = 8 + EquipmentRecord::INIT_SPACE,
+        seeds = [EQUIPMENT_SEED, player_avatar.key().as_ref()],
+        bump,
+        constraint = equipment_record.avatar == Pubkey::default()
+            || equipment_record.avatar == player_avatar.key()
+                @ ArenaRegistryError::InvalidEquipmentRecord,
+        constraint = equipment_record.owner == Pubkey::default()
+            || equipment_record.owner == owner.key()
+                @ ArenaRegistryError::InvalidEquipmentRecord,
+    )]
+    pub equipment_record: Account<'info, EquipmentRecord>,
+
+    #[account(mut)]
+    pub owner: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
 /// Customize the character: rename, change the cosmetic skin, and/or swap the
 /// base Avatar card (pass `new_avatar_asset`; swapping clears all equipped
 /// slots because the new card's `slot_mask` may differ).
@@ -507,7 +575,7 @@ pub struct MigrateRegistryV1<'info> {
 
 /// `commit_mint` (spec §12.1): lock a FUTURE slot + charge the non-refundable
 /// commit fee. No roll happens here — that is `reveal_mint`'s job, seeded by the
-/// then-unknown `target_slot` hash (revert-grind resistant).
+/// then-unknown first produced hash at/after `target_slot` (revert-grind resistant).
 #[derive(Accounts)]
 #[instruction(args: CommitMintArgs)]
 pub struct CommitMint<'info> {
@@ -646,6 +714,100 @@ pub struct RevealMint<'info> {
     pub rent: Sysvar<'info, Rent>,
 }
 
+/// `reveal_avatar_mint`: consume an existing paid `MintCommit`, mint the 1/1
+/// fighter NFT, and persist its canonical stats in an `ArenaAssetData` PDA
+/// derived from that mint. This PDA — not the forgeable Metaplex symbol — is
+/// the protocol authenticity proof for playable fighters.
+#[derive(Accounts)]
+#[instruction(nonce: u64)]
+pub struct RevealAvatarMint<'info> {
+    #[account(
+        mut,
+        seeds = [REGISTRY_SEED],
+        bump
+    )]
+    pub registry: Account<'info, ArenaRegistry>,
+
+    /// The paid pending commit. A successful avatar reveal is single-shot and
+    /// returns its rent to the original minter.
+    #[account(
+        mut,
+        close = minter,
+        has_one = minter,
+        seeds = [MINT_COMMIT_SEED, minter.key().as_ref(), &nonce.to_le_bytes()],
+        bump = mint_commit.bump,
+    )]
+    pub mint_commit: Account<'info, MintCommit>,
+
+    /// Fresh fighter NFT mint (supply 1, decimals 0 after the handler runs).
+    #[account(
+        init,
+        payer = minter,
+        mint::decimals = 0,
+        mint::authority = minter,
+        mint::freeze_authority = minter
+    )]
+    pub mint: Account<'info, Mint>,
+
+    /// Canonical fighter proof + durable combat stats, bound 1:1 to the NFT.
+    #[account(
+        init,
+        payer = minter,
+        space = 8 + ArenaAssetData::INIT_SPACE,
+        seeds = [ARENA_AVATAR_SEED, mint.key().as_ref()],
+        bump
+    )]
+    pub avatar_asset: Account<'info, ArenaAssetData>,
+
+    #[account(
+        init,
+        payer = minter,
+        associated_token::mint = mint,
+        associated_token::authority = minter
+    )]
+    pub minter_token_account: Account<'info, TokenAccount>,
+
+    #[account(mut)]
+    pub minter: Signer<'info>,
+
+    /// CHECK: Address-constrained to the SlotHashes sysvar; read as raw data.
+    #[account(address = anchor_lang::solana_program::sysvar::slot_hashes::ID)]
+    pub slot_hashes: AccountInfo<'info>,
+
+    /// CHECK: Canonical Metaplex Metadata PDA for `mint`; created by CPI.
+    #[account(
+        mut,
+        seeds = [b"metadata", token_metadata_program.key().as_ref(), mint.key().as_ref()],
+        bump,
+        seeds::program = token_metadata_program.key()
+    )]
+    pub metadata_account: UncheckedAccount<'info>,
+
+    /// CHECK: Canonical Metaplex Master Edition PDA for `mint`; created by CPI.
+    #[account(
+        mut,
+        seeds = [b"metadata", token_metadata_program.key().as_ref(), mint.key().as_ref(), b"edition"],
+        bump,
+        seeds::program = token_metadata_program.key()
+    )]
+    pub master_edition: UncheckedAccount<'info>,
+
+    // Optional Stellar accounts are revalidated and must match the identity
+    // bound into the fee-paying commit, exactly like `reveal_mint`.
+    /// CHECK: Validated by executable bit and the fixed solana-stellar id.
+    pub stellar_program: Option<AccountInfo<'info>>,
+    /// CHECK: Validated as a solana-stellar Release account by fixed layout.
+    pub stellar_release: Option<AccountInfo<'info>>,
+    /// CHECK: Validated against the vault stored in the Stellar release.
+    pub stellar_vault: Option<AccountInfo<'info>>,
+
+    pub token_metadata_program: Program<'info, Metadata>,
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, System>,
+    pub rent: Sysvar<'info, Rent>,
+}
+
 // ---------------------------------------------------------------------------
 // Item enhancement («заточка», docs/enhancement-design.md).
 // ---------------------------------------------------------------------------
@@ -737,7 +899,7 @@ pub struct MintEnhanceScroll<'info> {
 /// an SPL delegate could be unilaterally revoked/cleared by the owner to dodge
 /// a peeked loss, but an escrowed token is out of their reach. No roll happens
 /// here — that is `reveal_enhance`'s job, seeded by the then-unknown
-/// `target_slot` hash (same revert-grind-resistant shape as `commit_mint`).
+/// first produced hash at/after `target_slot` (same shape as `commit_mint`).
 #[derive(Accounts)]
 #[instruction(nonce: u64)]
 pub struct CommitEnhance<'info> {

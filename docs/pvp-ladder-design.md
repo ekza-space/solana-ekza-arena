@@ -166,7 +166,7 @@ pub struct Challenge {
     pub challenger: Pubkey,        // wallet issuing the challenge (its ArenaSnapshot fights)
     pub nonce: u64,                // PDA seed component
     pub opponent_snapshot: Pubkey, // the ghost ArenaSnapshot chosen AT COMMIT (locks the pairing)
-    pub target_slot: u64,          // slot + REVEAL_DELAY_SLOTS; its hash seeds the fight
+    pub target_slot: u64,          // lower bound; first produced hash >= it seeds the fight
     pub bump: u8,
 }
 ```
@@ -213,7 +213,7 @@ wallet-signed path is enough for v1.
 
 #### The resolve is permissionless — this is the anti-loss-dodge mechanism
 
-Once `target_slot` passes, the outcome is deterministic and the slot hash is
+Once the first produced slot at/after `target_slot` is recorded, the outcome is deterministic and its hash is
 public (~512-slot window in `SlotHashes`). A cheating challenger could compute
 the result locally and **withhold a losing reveal**. We defeat this by making
 `resolve_challenge` **callable by anyone**: the defender, a keeper bot, or the

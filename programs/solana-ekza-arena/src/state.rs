@@ -526,6 +526,13 @@ pub struct CreatePlayerAvatarArgs {
     pub name: String,
 }
 
+/// Holder-gated activation of a protocol-minted P3 fighter. Kept separate from
+/// `CreatePlayerAvatarArgs` so the legacy catalog-card create ABI stays intact.
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ActivateFighterV2Args {
+    pub name: String,
+}
+
 /// Args for `customize_avatar`. All fields optional — only supplied parts
 /// change. Passing a new `avatar_asset` account (see context) swaps the base
 /// character and clears all equipped slots.
@@ -651,7 +658,8 @@ pub struct CommitMintArgs {
 }
 
 /// A pending mint, committed to a FUTURE slot (spec §12.1). `reveal_mint` reads
-/// the hash of `target_slot` (unknown at commit time) to derive the seed, making
+/// the first produced hash at/after `target_slot` (unknown at commit time) to
+/// derive the seed, making
 /// the roll unpredictable and thus revert-grind resistant.
 #[account]
 pub struct MintCommit {

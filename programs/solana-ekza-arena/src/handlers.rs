@@ -17,18 +17,19 @@ use crate::{
         SUCCESS_BPS,
     },
     contexts::{
-        CloseExpiredCommit, CloseExpiredEnhanceCommit, CommitEnhance, CommitMint,
-        ConfigureRegistry, CreatePlayerAvatar, CustomizeAvatar, EquipItem, EquipItemV2,
+        ActivateFighterV2, CloseExpiredCommit, CloseExpiredEnhanceCommit, CommitEnhance,
+        CommitMint, ConfigureRegistry, CreatePlayerAvatar, CustomizeAvatar, EquipItem, EquipItemV2,
         MigrateRegistryV1, MintArenaItem, MintEnhanceScroll, RegisterArenaAsset,
-        RegisterArenaAssetFromStellar, RevealEnhance, RevealMint, RotateRegistryAuthority,
-        ScrapArenaItem, UnequipItem, UnequipItemV2,
+        RegisterArenaAssetFromStellar, RevealAvatarMint, RevealEnhance, RevealMint,
+        RotateRegistryAuthority, ScrapArenaItem, UnequipItem, UnequipItemV2,
     },
     error::ArenaRegistryError,
     state::{
-        ArenaAffix, ArenaAssetData, ArenaCardKind, ArenaElement, ArenaRarity, ArenaRegistry,
-        ArenaStats, CommitMintArgs, ConfigureRegistryArgs, CreatePlayerAvatarArgs,
-        CustomizeAvatarArgs, EnhanceResult, ItemSkin, MintArenaItemArgs, MintEnhanceScrollArgs,
-        MintSkinArg, PlayerAvatar, RegisterArenaAssetArgs, RegisterArenaAssetFromStellarArgs,
+        ActivateFighterV2Args, ArenaAffix, ArenaAssetData, ArenaCardKind, ArenaElement,
+        ArenaRarity, ArenaRegistry, ArenaStats, CommitMintArgs, ConfigureRegistryArgs,
+        CreatePlayerAvatarArgs, CustomizeAvatarArgs, EnhanceResult, ItemSkin, MintArenaItemArgs,
+        MintEnhanceScrollArgs, MintSkinArg, PlayerAvatar, RegisterArenaAssetArgs,
+        RegisterArenaAssetFromStellarArgs,
     },
     utils::{deposit_revenue_to_stellar, validate_stellar_release, StellarReleaseOrigin},
     utils::{
@@ -261,20 +262,34 @@ fn recent_slothash_u64(slot_hashes: &AccountInfo) -> Result<u64> {
     Ok(u64::from_le_bytes(data[16..24].try_into().unwrap()))
 }
 
-/// First 8 bytes (LE u64) of the hash of EXACTLY `target_slot` from the
-/// SlotHashes sysvar (spec §12.1). SlotHashes holds ~512 recent entries, newest
-/// first: `[len: u64][ (slot: u64, hash: [u8;32]) ; len ]`. Returns
-/// `SlotHashNotFound` if `target_slot` has aged out (or never existed).
-fn slothash_of_slot(slot_hashes: &AccountInfo, target_slot: u64) -> Result<u64> {
+/// First 8 bytes (LE u64) of the first produced slot hash at or after the
+/// committed lower bound. Slots may be skipped, so requiring an exact slot can
+/// make an otherwise valid paid commit permanently unrevealable.
+///
+/// SlotHashes is newest-first. For a skipped target we only accept a candidate
+/// after observing an older entry below the target. That boundary proves the
+/// candidate is the first produced slot, and prevents a late reveal from
+/// silently shifting to a newer hash after the canonical one has aged out.
+fn slothash_at_or_after(slot_hashes: &AccountInfo, target_slot: u64) -> Result<u64> {
     let data = slot_hashes.try_borrow_data()?;
+    slothash_at_or_after_data(&data, target_slot)
+}
+
+fn slothash_at_or_after_data(data: &[u8], target_slot: u64) -> Result<u64> {
     require!(data.len() >= 8, ArenaRegistryError::InvalidSlotHashes);
     let len = u64::from_le_bytes(data[0..8].try_into().unwrap()) as usize;
-    // Each entry = 8 (slot) + 32 (hash) = 40 bytes, starting at offset 8.
+    let required_len = len
+        .checked_mul(40)
+        .and_then(|entries| entries.checked_add(8))
+        .ok_or(ArenaRegistryError::InvalidSlotHashes)?;
+    require!(
+        data.len() >= required_len,
+        ArenaRegistryError::InvalidSlotHashes
+    );
+
+    let mut candidate = None;
     for i in 0..len {
         let base = 8 + i * 40;
-        if data.len() < base + 40 {
-            break;
-        }
         let slot = u64::from_le_bytes(data[base..base + 8].try_into().unwrap());
         if slot == target_slot {
             let hash_off = base + 8;
@@ -282,7 +297,18 @@ fn slothash_of_slot(slot_hashes: &AccountInfo, target_slot: u64) -> Result<u64> 
                 data[hash_off..hash_off + 8].try_into().unwrap(),
             ));
         }
+        if slot > target_slot {
+            let hash_off = base + 8;
+            candidate = Some(u64::from_le_bytes(
+                data[hash_off..hash_off + 8].try_into().unwrap(),
+            ));
+        } else {
+            return candidate.ok_or(ArenaRegistryError::SlotHashNotFound.into());
+        }
     }
+    // All retained entries are newer than the target. Without the lower
+    // boundary we cannot distinguish "first post-target slot not recorded yet"
+    // from "canonical slot hash aged out", so fail closed and allow a retry.
     Err(ArenaRegistryError::SlotHashNotFound.into())
 }
 
@@ -545,6 +571,25 @@ fn validate_nft_metadata(name: &str, symbol: &str, uri: &str) -> Result<()> {
     Ok(())
 }
 
+/// Fighter metadata is a gameplay identity boundary rather than merely NFT
+/// display text. Keep it canonical enough that clients never need to accept
+/// ambiguous names/URIs while authenticating the mint-keyed proof PDA.
+fn validate_fighter_metadata(name: &str, uri: &str) -> Result<()> {
+    let clean_name = !name.is_empty()
+        && name == name.trim()
+        && name.len() <= MintArenaItemArgs::MAX_NAME_LEN
+        && !name.chars().any(char::is_control);
+    let clean_uri = uri == uri.trim()
+        && uri.len() <= MintArenaItemArgs::MAX_URI_LEN
+        && (uri.starts_with("https://") || uri.starts_with("ipfs://"))
+        && !uri.chars().any(char::is_control);
+    require!(
+        clean_name && clean_uri,
+        ArenaRegistryError::InvalidFighterMetadata
+    );
+    Ok(())
+}
+
 fn validate_registry_config(args: &ConfigureRegistryArgs) -> Result<()> {
     let total_bps = u32::from(args.creator_bps)
         .checked_add(u32::from(args.platform_bps))
@@ -708,6 +753,16 @@ fn require_rent_safe_fee_destination(account: &AccountInfo, amount: u64) -> Resu
 /// its SlotHash expires, but no paid SOL can remain stranded in a commit PDA.
 pub fn commit_mint(ctx: Context<CommitMint>, args: CommitMintArgs) -> Result<()> {
     validate_nft_metadata(&args.name, &args.symbol, &args.uri)?;
+    // Canonical EKZAF0..3 commits are fighter intents from this point on. Bind
+    // their carrier + stricter metadata BEFORE taking the non-refundable fee,
+    // so a malformed fighter cannot become a paid but unrevealable commit.
+    if crate::fighter::faction_from_symbol(&args.symbol).is_some() {
+        require!(
+            args.base_type == crate::state::ArenaBaseType::Charm,
+            ArenaRegistryError::InvalidFighterCommit
+        );
+        validate_fighter_metadata(&args.name, &args.uri)?;
+    }
 
     let registry = &ctx.accounts.registry;
     // The registry must have been configured with a real treasury + fee.
@@ -848,6 +903,14 @@ fn commit_expires_after(target_slot: u64) -> Result<u64> {
 }
 
 pub fn reveal_mint(ctx: Context<RevealMint>, _nonce: u64) -> Result<()> {
+    // Canonical fighter intents must never be consumable through the generic
+    // gear branch. Otherwise an attacker could mint EKZAF metadata while
+    // deliberately avoiding the mint-keyed Avatar proof PDA.
+    require!(
+        crate::fighter::faction_from_symbol(&ctx.accounts.mint_commit.symbol).is_none(),
+        ArenaRegistryError::FighterSymbolReserved
+    );
+
     // 1. Enforce the reveal window: the target slot must have PASSED, and its
     //    hash must still be retrievable from SlotHashes (spec §12.1).
     let target_slot = ctx.accounts.mint_commit.target_slot;
@@ -858,7 +921,7 @@ pub fn reveal_mint(ctx: Context<RevealMint>, _nonce: u64) -> Result<()> {
         now <= expires_after,
         ArenaRegistryError::RevealWindowExpired
     );
-    let slothash_u64 = slothash_of_slot(&ctx.accounts.slot_hashes, target_slot)?;
+    let slothash_u64 = slothash_at_or_after(&ctx.accounts.slot_hashes, target_slot)?;
 
     // 2. Seed = splitmix64_mix(target_slothash ^ minter_first8 ^ commit_first8).
     let minter = ctx.accounts.minter.key();
@@ -1010,6 +1073,197 @@ pub fn reveal_mint(ctx: Context<RevealMint>, _nonce: u64) -> Result<()> {
 
     // 6. `MintCommit` is closed by the `close = minter` constraint (rent →
     //    minter). Single-shot: this commit can never be revealed again.
+    Ok(())
+}
+
+/// Hardened playable-fighter reveal.
+///
+/// The already-paid `MintCommit` remains the common commit ABI, so existing
+/// item clients and pending item commits are untouched. A fighter intent is
+/// recognized only when all of the following hold:
+///
+/// - the inert carrier class is `Charm` (the existing web convention);
+/// - the symbol is exactly one of `EKZAF0..3`, which binds the faction;
+/// - name/URI are canonical bounded display metadata.
+///
+/// Successful reveal writes an `ArenaAssetData { Avatar }` at
+/// `[ARENA_AVATAR_SEED, mint]`. That program-owned mint-keyed PDA is the
+/// anti-spoof proof; the Metaplex symbol by itself is never authoritative.
+pub fn reveal_avatar_mint(ctx: Context<RevealAvatarMint>, _nonce: u64) -> Result<()> {
+    let commit = &ctx.accounts.mint_commit;
+    require!(
+        commit.base_type == crate::state::ArenaBaseType::Charm,
+        ArenaRegistryError::InvalidFighterCommit
+    );
+    let faction = crate::fighter::faction_from_symbol(&commit.symbol)
+        .ok_or(ArenaRegistryError::InvalidFighterSymbol)?;
+    validate_fighter_metadata(&commit.name, &commit.uri)?;
+
+    // Same future-slot, expiry, and seed contract as the item reveal. The
+    // caller-chosen fresh mint never contributes entropy, so key grinding
+    // cannot improve fighter stats.
+    let target_slot = commit.target_slot;
+    let now = Clock::get()?.slot;
+    require!(now > target_slot, ArenaRegistryError::RevealTooEarly);
+    let expires_after = commit_expires_after(target_slot)?;
+    require!(
+        now <= expires_after,
+        ArenaRegistryError::RevealWindowExpired
+    );
+    let slothash_u64 = slothash_at_or_after(&ctx.accounts.slot_hashes, target_slot)?;
+    let minter = ctx.accounts.minter.key();
+    let minter_first8 = u64::from_le_bytes(minter.to_bytes()[0..8].try_into().unwrap());
+    let commit_key = ctx.accounts.mint_commit.key();
+    let commit_first8 = u64::from_le_bytes(commit_key.to_bytes()[0..8].try_into().unwrap());
+    let seed = crate::affix::splitmix64_mix(slothash_u64 ^ minter_first8 ^ commit_first8);
+    let rolled = crate::fighter::roll_fighter(seed, faction)
+        .ok_or(ArenaRegistryError::InvalidFighterSymbol)?;
+
+    // Resolve the committed cosmetic identity again, and bind any Stellar
+    // origin to the exact release/vault/asset whose creator fee was paid.
+    let resolved_skin = resolve_skin_accounts(
+        commit.skin.clone(),
+        ctx.accounts.stellar_program.as_ref(),
+        ctx.accounts.stellar_release.as_ref(),
+        ctx.accounts.stellar_vault.as_ref(),
+    )?;
+    if let Some(origin) = resolved_skin.stellar_origin.as_ref() {
+        require_keys_eq!(
+            ctx.accounts
+                .stellar_release
+                .as_ref()
+                .ok_or(ArenaRegistryError::MissingStellarSkinAccounts)?
+                .key(),
+            commit.stellar_release,
+            ArenaRegistryError::StellarCommitMismatch
+        );
+        require_keys_eq!(
+            origin.vault,
+            commit.stellar_vault,
+            ArenaRegistryError::StellarCommitMismatch
+        );
+        require_keys_eq!(
+            origin.asset,
+            commit.stellar_asset,
+            ArenaRegistryError::StellarCommitMismatch
+        );
+        require_keys_eq!(
+            origin.authority,
+            commit.royalty_recipient,
+            ArenaRegistryError::StellarCommitMismatch
+        );
+    } else {
+        require!(
+            commit.stellar_release == Pubkey::default()
+                && commit.stellar_vault == Pubkey::default()
+                && commit.stellar_asset == Pubkey::default(),
+            ArenaRegistryError::StellarCommitMismatch
+        );
+    }
+    let skin_ref = resolved_skin.skin_ref;
+
+    // Real immutable 1/1 NFT. Re-derive the canonical symbol from the parsed
+    // faction rather than blindly copying caller text into Metadata.
+    mint_to(
+        CpiContext::new(
+            ctx.accounts.token_program.to_account_info(),
+            MintTo {
+                mint: ctx.accounts.mint.to_account_info(),
+                to: ctx.accounts.minter_token_account.to_account_info(),
+                authority: ctx.accounts.minter.to_account_info(),
+            },
+        ),
+        1,
+    )?;
+
+    let canonical_symbol = crate::fighter::symbol_for_faction(faction)
+        .ok_or(ArenaRegistryError::InvalidFighterSymbol)?;
+    let data = DataV2 {
+        name: commit.name.clone(),
+        symbol: canonical_symbol.to_string(),
+        uri: commit.uri.clone(),
+        seller_fee_basis_points: ITEM_ROYALTY_BPS,
+        creators: Some(vec![Creator {
+            address: commit.royalty_recipient,
+            verified: commit.royalty_recipient == minter,
+            share: 100,
+        }]),
+        collection: None,
+        uses: None,
+    };
+    create_metadata_accounts_v3(
+        CpiContext::new(
+            ctx.accounts.token_metadata_program.to_account_info(),
+            CreateMetadataAccountsV3 {
+                metadata: ctx.accounts.metadata_account.to_account_info(),
+                mint: ctx.accounts.mint.to_account_info(),
+                mint_authority: ctx.accounts.minter.to_account_info(),
+                payer: ctx.accounts.minter.to_account_info(),
+                update_authority: ctx.accounts.minter.to_account_info(),
+                system_program: ctx.accounts.system_program.to_account_info(),
+                rent: ctx.accounts.rent.to_account_info(),
+            },
+        ),
+        data,
+        false,
+        true,
+        None,
+    )?;
+    create_master_edition_v3(
+        CpiContext::new(
+            ctx.accounts.token_metadata_program.to_account_info(),
+            CreateMasterEditionV3 {
+                edition: ctx.accounts.master_edition.to_account_info(),
+                mint: ctx.accounts.mint.to_account_info(),
+                update_authority: ctx.accounts.minter.to_account_info(),
+                mint_authority: ctx.accounts.minter.to_account_info(),
+                payer: ctx.accounts.minter.to_account_info(),
+                metadata: ctx.accounts.metadata_account.to_account_info(),
+                token_program: ctx.accounts.token_program.to_account_info(),
+                system_program: ctx.accounts.system_program.to_account_info(),
+                rent: ctx.accounts.rent.to_account_info(),
+            },
+        ),
+        Some(0),
+    )?;
+
+    // Durable gameplay truth. `archetype_id = fighter:<mint>` preserves the
+    // web/domain identity contract and redundantly binds the fresh mint inside
+    // the account data; the primary binding remains the PDA seed itself.
+    let mint_key = ctx.accounts.mint.key();
+    let registry = &mut ctx.accounts.registry;
+    registry.bump = ctx.bumps.registry;
+    let index = registry.next_index;
+    registry.next_index = registry
+        .next_index
+        .checked_add(1)
+        .ok_or(ArenaRegistryError::NumericalOverflow)?;
+
+    let avatar = &mut ctx.accounts.avatar_asset;
+    avatar.metadata_ipfs_hash = commit.uri.clone();
+    avatar.creator = commit.royalty_recipient;
+    avatar.index = index;
+    avatar.card_kind = ArenaCardKind::Avatar;
+    avatar.archetype_id = format!("fighter:{mint_key}");
+    avatar.base_stats = ArenaStats {
+        hp: rolled.stats.hp,
+        attack: rolled.stats.attack,
+        armor: rolled.stats.armor,
+        speed: rolled.stats.speed,
+    };
+    avatar.stat_delta = ArenaStats::default();
+    // All four legacy item classes are enabled. The v2 7-slot record maps its
+    // named slots back through these same four governing bits.
+    avatar.slot_mask = 0b0000_1111;
+    avatar.rarity = ArenaRarity::from_roll(rolled.rarity);
+    avatar.element = ArenaElement::None;
+    avatar.skill_ids = rolled.skill_ids.into_iter().map(str::to_string).collect();
+    avatar.skin_ref = skin_ref;
+    avatar.bump = ctx.bumps.avatar_asset;
+
+    // `MintCommit` closes to `minter` via the account constraint. There is no
+    // `ArenaItem` for this mint, so it can never become equippable gear merely
+    // by claiming an EKZAF symbol.
     Ok(())
 }
 
@@ -1298,7 +1552,7 @@ pub fn reveal_enhance(ctx: Context<RevealEnhance>, nonce: u64) -> Result<()> {
         now <= commit_expires_after(target_slot)?,
         ArenaRegistryError::RevealWindowExpired
     );
-    let slothash_u64 = slothash_of_slot(&ctx.accounts.slot_hashes, target_slot)?;
+    let slothash_u64 = slothash_at_or_after(&ctx.accounts.slot_hashes, target_slot)?;
 
     // 2. Seed = splitmix64_mix(target_slothash ^ owner_first8 ^ item_first8 ^
     //    nonce) — the same first-8-LE-bytes mixing style as reveal_mint, over
@@ -1519,6 +1773,24 @@ fn validate_avatar_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// The `fighter:` archetype namespace is written only by
+/// `reveal_avatar_mint` and selected only by `activate_fighter_v2`.
+///
+/// Reserving the whole prefix is intentionally stricter than parsing a pubkey:
+/// legacy catalog cards must never become indistinguishable from current or
+/// future mint-keyed fighter proofs to a downstream reader.
+fn require_legacy_catalog_avatar(card: &ArenaAssetData) -> Result<()> {
+    require!(
+        card.card_kind == ArenaCardKind::Avatar,
+        ArenaRegistryError::InvalidAvatarAsset
+    );
+    require!(
+        !card.archetype_id.starts_with("fighter:"),
+        ArenaRegistryError::FighterActivationRequired
+    );
+    Ok(())
+}
+
 /// Cosmetic-only skin args allowed on a `PlayerAvatar` (no Stellar accounts in
 /// the customize path — Stellar identity enters via the avatar card itself).
 fn resolve_cosmetic_skin(skin: MintSkinArg) -> Result<ItemSkin> {
@@ -1544,10 +1816,7 @@ pub fn create_player_avatar(
 ) -> Result<()> {
     validate_avatar_name(&args.name)?;
     let card = &ctx.accounts.avatar_asset;
-    require!(
-        card.card_kind == ArenaCardKind::Avatar,
-        ArenaRegistryError::InvalidAvatarAsset
-    );
+    require_legacy_catalog_avatar(card)?;
 
     let avatar = &mut ctx.accounts.player_avatar;
     avatar.owner = ctx.accounts.owner.key();
@@ -1560,14 +1829,48 @@ pub fn create_player_avatar(
     Ok(())
 }
 
+/// Create or switch the wallet's active protocol-minted fighter.
+///
+/// Account constraints prove current NFT ownership and the mint-keyed Avatar
+/// PDA before this handler runs. The exact `fighter:<mint>` identity check is
+/// redundant with the PDA seed by design: it catches corrupt/stale data and
+/// gives downstream clients one stable identity string.
+pub fn activate_fighter_v2(
+    ctx: Context<ActivateFighterV2>,
+    args: ActivateFighterV2Args,
+) -> Result<()> {
+    validate_avatar_name(&args.name)?;
+
+    let owner = ctx.accounts.owner.key();
+    let player_avatar_key = ctx.accounts.player_avatar.key();
+    let fighter_mint = ctx.accounts.fighter_mint.key();
+    require!(
+        ctx.accounts.avatar_asset.archetype_id == format!("fighter:{fighter_mint}"),
+        ArenaRegistryError::InvalidFighterAvatar
+    );
+
+    let avatar = &mut ctx.accounts.player_avatar;
+    avatar.owner = owner;
+    avatar.avatar_asset = ctx.accounts.avatar_asset.key();
+    avatar.name = args.name;
+    avatar.skin_ref = ctx.accounts.avatar_asset.skin_ref.clone();
+    avatar.slot_mask = ctx.accounts.avatar_asset.slot_mask;
+    avatar.equipped = [Pubkey::default(); PlayerAvatar::SLOT_COUNT];
+    avatar.bump = ctx.bumps.player_avatar;
+
+    let record = &mut ctx.accounts.equipment_record;
+    record.avatar = player_avatar_key;
+    record.owner = owner;
+    record.slots = [Pubkey::default(); crate::state::EQUIPMENT_RECORD_SLOTS];
+    record.bump = ctx.bumps.equipment_record;
+    Ok(())
+}
+
 pub fn customize_avatar(ctx: Context<CustomizeAvatar>, args: CustomizeAvatarArgs) -> Result<()> {
     // Swap the base card first: it resets skin/slots, which the explicit
     // name/skin args below may then override in the same call.
     if let Some(card) = &ctx.accounts.new_avatar_asset {
-        require!(
-            card.card_kind == ArenaCardKind::Avatar,
-            ArenaRegistryError::InvalidAvatarAsset
-        );
+        require_legacy_catalog_avatar(card)?;
         let avatar = &mut ctx.accounts.player_avatar;
         avatar.avatar_asset = card.key();
         avatar.skin_ref = card.skin_ref.clone();
@@ -1625,6 +1928,37 @@ fn touch_equipment_record(
     record.bump = bump;
 }
 
+/// Move an NFT mint into exactly one active v2 slot and keep the legacy mirror
+/// coherent. Clearing every old occurrence also repairs records written by the
+/// pre-uniqueness implementation the next time that mint is equipped.
+fn move_equipped_mint(
+    record_slots: &mut [Pubkey; crate::state::EQUIPMENT_RECORD_SLOTS],
+    legacy_slots: &mut [Pubkey; crate::state::EQUIP_SLOT_COUNT],
+    mint: Pubkey,
+    target_slot: u8,
+) {
+    for current in record_slots
+        .iter_mut()
+        .take(crate::state::ACTIVE_EQUIP_SLOT_COUNT as usize)
+    {
+        if *current == mint {
+            *current = Pubkey::default();
+        }
+    }
+    // A legacy-only equip may predate creation of EquipmentRecord, so clear
+    // the mint from that view even when no v2 occurrence was found.
+    for current in legacy_slots.iter_mut() {
+        if *current == mint {
+            *current = Pubkey::default();
+        }
+    }
+
+    record_slots[target_slot as usize] = mint;
+    if let Some(legacy) = crate::state::legacy_equipped_index(target_slot) {
+        legacy_slots[legacy] = mint;
+    }
+}
+
 /// Equip an owned item NFT into an explicit v2 slot (0..6).
 ///
 /// Checks, in order:
@@ -1662,12 +1996,7 @@ pub fn equip_item_v2(ctx: Context<EquipItemV2>, slot: u8) -> Result<()> {
         ctx.accounts.owner.key(),
         ctx.bumps.equipment_record,
     );
-    record.slots[slot as usize] = mint;
-
-    // Keep the legacy 4-slot view in sync for canonical slots.
-    if let Some(legacy) = crate::state::legacy_equipped_index(slot) {
-        avatar.equipped[legacy] = mint;
-    }
+    move_equipped_mint(&mut record.slots, &mut avatar.equipped, mint, slot);
     Ok(())
 }
 
@@ -1695,6 +2024,40 @@ pub fn unequip_item_v2(ctx: Context<UnequipItemV2>, slot: u8) -> Result<()> {
 #[cfg(test)]
 mod registry_security_tests {
     use super::*;
+
+    fn slot_hashes_data(entries: &[(u64, u64)]) -> Vec<u8> {
+        let mut data = Vec::with_capacity(8 + entries.len() * 40);
+        data.extend_from_slice(&(entries.len() as u64).to_le_bytes());
+        for (slot, hash_first8) in entries {
+            data.extend_from_slice(&slot.to_le_bytes());
+            data.extend_from_slice(&hash_first8.to_le_bytes());
+            data.extend_from_slice(&[0u8; 24]);
+        }
+        data
+    }
+
+    #[test]
+    fn reveal_entropy_uses_first_produced_slot_at_or_after_target() {
+        let exact = slot_hashes_data(&[(110, 11), (105, 22), (104, 33)]);
+        assert_eq!(slothash_at_or_after_data(&exact, 105).unwrap(), 22);
+
+        // 105..107 were skipped: 108, not newest 111, is canonical.
+        let skipped = slot_hashes_data(&[(111, 44), (108, 55), (104, 66)]);
+        assert_eq!(slothash_at_or_after_data(&skipped, 105).unwrap(), 55);
+
+        // No produced slot at/after target yet.
+        let too_early = slot_hashes_data(&[(104, 77), (103, 88)]);
+        assert!(slothash_at_or_after_data(&too_early, 105).is_err());
+
+        // All retained entries are newer: the canonical boundary aged out, so
+        // selecting the oldest retained value would create a timing reroll.
+        let aged_out = slot_hashes_data(&[(700, 99), (600, 111)]);
+        assert!(slothash_at_or_after_data(&aged_out, 100).is_err());
+
+        let mut truncated = slot_hashes_data(&[(110, 1), (104, 2)]);
+        truncated.pop();
+        assert!(slothash_at_or_after_data(&truncated, 105).is_err());
+    }
 
     #[test]
     fn legacy_registry_decoder_accepts_only_the_exact_v1_layout() {
@@ -1750,6 +2113,147 @@ mod registry_security_tests {
             7 + COMMIT_REVEAL_WINDOW_SLOTS
         );
         assert!(commit_expires_after(u64::MAX).is_err());
+    }
+
+    #[test]
+    fn fighter_metadata_uses_the_actual_arena_asset_storage_boundary() {
+        assert_eq!(
+            MintArenaItemArgs::MAX_URI_LEN,
+            ArenaAssetData::MAX_METADATA_HASH_LEN
+        );
+        let max_uri = format!(
+            "https://{}",
+            "a".repeat(ArenaAssetData::MAX_METADATA_HASH_LEN - "https://".len())
+        );
+        assert_eq!(max_uri.len(), ArenaAssetData::MAX_METADATA_HASH_LEN);
+        assert!(validate_fighter_metadata("Canonical Fighter", &max_uri).is_ok());
+
+        let oversized = format!("{max_uri}x");
+        assert!(validate_fighter_metadata("Canonical Fighter", &oversized).is_err());
+        assert!(validate_fighter_metadata(" Fighter", "https://example.test/f.json").is_err());
+        assert!(validate_fighter_metadata("Fighter", "data:application/json,{}").is_err());
+        assert!(validate_fighter_metadata("Fighter\n", "https://example.test/f.json").is_err());
+    }
+
+    #[test]
+    fn maximum_fighter_payload_serializes_into_arena_asset_space() {
+        let mint = Pubkey::new_unique();
+        let archetype_id = format!("fighter:{mint}");
+        assert!(archetype_id.len() <= ArenaAssetData::MAX_ARCHETYPE_ID_LEN);
+        let metadata_ipfs_hash = format!(
+            "https://{}",
+            "a".repeat(ArenaAssetData::MAX_METADATA_HASH_LEN - "https://".len())
+        );
+        let fighter = ArenaAssetData {
+            metadata_ipfs_hash,
+            creator: Pubkey::new_unique(),
+            index: u64::MAX,
+            card_kind: ArenaCardKind::Avatar,
+            archetype_id,
+            base_stats: ArenaStats {
+                hp: i16::MAX,
+                attack: i16::MAX,
+                armor: i16::MAX,
+                speed: i16::MAX,
+            },
+            stat_delta: ArenaStats::default(),
+            slot_mask: 0b1111,
+            rarity: ArenaRarity::Mythic,
+            element: ArenaElement::None,
+            skill_ids: vec!["jewelry_focus".to_string(), "heavy_guard".to_string()],
+            skin_ref: ItemSkin::Ipfs("x".repeat(ItemSkin::MAX_IPFS_LEN)),
+            bump: u8::MAX,
+        };
+        let mut account_data = vec![0u8; 8 + ArenaAssetData::INIT_SPACE];
+        fighter
+            .try_serialize(&mut &mut account_data[..])
+            .expect("fighter must fit the declared ArenaAssetData allocation");
+    }
+
+    #[test]
+    fn legacy_avatar_paths_reserve_the_protocol_fighter_namespace() {
+        let mut card = ArenaAssetData {
+            metadata_ipfs_hash: "https://example.test/avatar.json".to_string(),
+            creator: Pubkey::new_unique(),
+            index: 1,
+            card_kind: ArenaCardKind::Avatar,
+            archetype_id: "catalog-avatar".to_string(),
+            base_stats: ArenaStats::default(),
+            stat_delta: ArenaStats::default(),
+            slot_mask: 0b1111,
+            rarity: ArenaRarity::Common,
+            element: ArenaElement::None,
+            skill_ids: Vec::new(),
+            skin_ref: ItemSkin::Builtin(0),
+            bump: 255,
+        };
+        assert!(require_legacy_catalog_avatar(&card).is_ok());
+
+        card.archetype_id = format!("fighter:{}", Pubkey::new_unique());
+        assert!(require_legacy_catalog_avatar(&card).is_err());
+
+        // Reserve malformed/future values too: prefix identity must never be
+        // accepted through an instruction that carries no mint/ATA proof.
+        card.archetype_id = "fighter:not-a-pubkey".to_string();
+        assert!(require_legacy_catalog_avatar(&card).is_err());
+
+        card.archetype_id = "catalog-avatar".to_string();
+        card.card_kind = ArenaCardKind::Modifier;
+        assert!(require_legacy_catalog_avatar(&card).is_err());
+    }
+
+    #[test]
+    fn v2_equip_move_keeps_one_active_occurrence_and_repairs_legacy() {
+        let mint = Pubkey::new_unique();
+        let other = Pubkey::new_unique();
+        let mut record = [Pubkey::default(); crate::state::EQUIPMENT_RECORD_SLOTS];
+        let mut legacy = [Pubkey::default(); crate::state::EQUIP_SLOT_COUNT];
+
+        // Model a pre-fix duplicate Armor plus a legacy-only occurrence.
+        record[crate::state::EQUIP_SLOT_BODY as usize] = mint;
+        record[crate::state::EQUIP_SLOT_GLOVES as usize] = mint;
+        record[crate::state::EQUIP_SLOT_WEAPON as usize] = other;
+        legacy[2] = mint;
+        move_equipped_mint(
+            &mut record,
+            &mut legacy,
+            mint,
+            crate::state::EQUIP_SLOT_BOOTS,
+        );
+
+        assert_eq!(
+            record[crate::state::EQUIP_SLOT_BODY as usize],
+            Pubkey::default()
+        );
+        assert_eq!(
+            record[crate::state::EQUIP_SLOT_GLOVES as usize],
+            Pubkey::default()
+        );
+        assert_eq!(record[crate::state::EQUIP_SLOT_BOOTS as usize], mint);
+        assert_eq!(record[crate::state::EQUIP_SLOT_WEAPON as usize], other);
+        assert_eq!(legacy[2], Pubkey::default());
+        assert_eq!(
+            record
+                .iter()
+                .take(crate::state::ACTIVE_EQUIP_SLOT_COUNT as usize)
+                .filter(|&&value| value == mint)
+                .count(),
+            1
+        );
+
+        // Moving back to canonical Body creates exactly its one legacy mirror.
+        move_equipped_mint(
+            &mut record,
+            &mut legacy,
+            mint,
+            crate::state::EQUIP_SLOT_BODY,
+        );
+        assert_eq!(
+            record[crate::state::EQUIP_SLOT_BOOTS as usize],
+            Pubkey::default()
+        );
+        assert_eq!(record[crate::state::EQUIP_SLOT_BODY as usize], mint);
+        assert_eq!(legacy[2], mint);
     }
 
     #[test]

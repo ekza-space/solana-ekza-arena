@@ -148,8 +148,8 @@ export function resolveWinner(
     aHp !== bHp
       ? aHp > bHp
       : effAttack(a) !== effAttack(b)
-        ? effAttack(a) > effAttack(b)
-        : tieBreakEven(`${a58}${b58}`, nonce);
+      ? effAttack(a) > effAttack(b)
+      : tieBreakEven(`${a58}${b58}`, nonce);
   return { winnerIsA, rounds };
 }
 

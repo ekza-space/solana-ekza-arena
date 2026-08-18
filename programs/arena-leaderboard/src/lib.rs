@@ -87,7 +87,7 @@ pub mod arena_leaderboard {
     }
 
     /// Commit to fight a specific opponent ghost at a future slot. Locks the
-    /// pairing + `target_slot` (whose hash later seeds the fight). Wallet or
+    /// pairing + `target_slot` (the first produced hash at/after it seeds the fight). Wallet or
     /// session-key signed.
     pub fn commit_challenge(ctx: Context<CommitChallenge>, nonce: u64) -> Result<()> {
         handlers::commit_challenge(ctx, nonce)

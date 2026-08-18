@@ -35,7 +35,9 @@ pub enum LeaderboardError {
     ChallengeNotExpired,
     #[msg("Invalid SlotHashes sysvar account.")]
     InvalidSlotHashes,
-    #[msg("The committed target slot's hash is no longer in the SlotHashes sysvar.")]
+    #[msg(
+        "The canonical slot hash at/after the committed target is not provable from SlotHashes."
+    )]
     SlotHashNotFound,
     #[msg("Snapshot/PDA account does not match the challenge it is resolved against.")]
     SnapshotMismatch,

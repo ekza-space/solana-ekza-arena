@@ -253,11 +253,11 @@ pub fn resolve_challenge(
         LeaderboardError::ChallengeWindowExpired
     );
 
-    // Seed = splitmix64_mix(slothash(target) ^ first8(challenger) ^
+    // Seed = splitmix64_mix(slothash(first produced slot >= target) ^ first8(challenger) ^
     //                       first8(opp_snapshot) ^ commit_nonce)  (design §2.6).
     let opp_snapshot_key = ctx.accounts.challenge.opponent_snapshot;
     let commit_nonce = ctx.accounts.challenge.nonce;
-    let slothash = slothash_of_slot(&ctx.accounts.slot_hashes, target_slot)?;
+    let slothash = slothash_at_or_after(&ctx.accounts.slot_hashes, target_slot)?;
     let seed =
         splitmix64_mix(slothash ^ first8(&challenger) ^ first8(&opp_snapshot_key) ^ commit_nonce);
 
@@ -405,24 +405,45 @@ fn splitmix64_mix(x: u64) -> u64 {
     z ^ (z >> 31)
 }
 
-/// First 8 bytes (LE u64) of the hash of EXACTLY `target_slot` from SlotHashes.
-/// Layout: `[len: u64][ (slot: u64, hash: [u8;32]) ; len ]`, newest first.
-/// Errors if `target_slot` has aged out (mirrors the mint reveal path).
-fn slothash_of_slot(slot_hashes: &AccountInfo, target_slot: u64) -> Result<u64> {
+/// First 8 bytes (LE u64) of the first produced slot hash at or after the
+/// committed lower bound. SlotHashes is newest-first and may omit skipped
+/// slots. A skipped-target candidate is accepted only after an older entry
+/// below the target proves the canonical boundary; this prevents rerolling
+/// against a later retained hash after the original candidate has aged out.
+fn slothash_at_or_after(slot_hashes: &AccountInfo, target_slot: u64) -> Result<u64> {
     let data = slot_hashes.try_borrow_data()?;
+    slothash_at_or_after_data(&data, target_slot)
+}
+
+fn slothash_at_or_after_data(data: &[u8], target_slot: u64) -> Result<u64> {
     require!(data.len() >= 8, LeaderboardError::InvalidSlotHashes);
     let len = u64::from_le_bytes(data[0..8].try_into().unwrap()) as usize;
+    let required_len = len
+        .checked_mul(40)
+        .and_then(|entries| entries.checked_add(8))
+        .ok_or(LeaderboardError::InvalidSlotHashes)?;
+    require!(
+        data.len() >= required_len,
+        LeaderboardError::InvalidSlotHashes
+    );
+
+    let mut candidate = None;
     for i in 0..len {
         let base = 8 + i * 40;
-        if data.len() < base + 40 {
-            break;
-        }
         let slot = u64::from_le_bytes(data[base..base + 8].try_into().unwrap());
         if slot == target_slot {
             let hash_off = base + 8;
             return Ok(u64::from_le_bytes(
                 data[hash_off..hash_off + 8].try_into().unwrap(),
             ));
+        }
+        if slot > target_slot {
+            let hash_off = base + 8;
+            candidate = Some(u64::from_le_bytes(
+                data[hash_off..hash_off + 8].try_into().unwrap(),
+            ));
+        } else {
+            return candidate.ok_or(LeaderboardError::SlotHashNotFound.into());
         }
     }
     Err(LeaderboardError::SlotHashNotFound.into())
@@ -506,6 +527,36 @@ fn elo_delta(ra: i32, rb: i32, won: bool) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn slot_hashes_data(entries: &[(u64, u64)]) -> Vec<u8> {
+        let mut data = Vec::with_capacity(8 + entries.len() * 40);
+        data.extend_from_slice(&(entries.len() as u64).to_le_bytes());
+        for (slot, hash_first8) in entries {
+            data.extend_from_slice(&slot.to_le_bytes());
+            data.extend_from_slice(&hash_first8.to_le_bytes());
+            data.extend_from_slice(&[0u8; 24]);
+        }
+        data
+    }
+
+    #[test]
+    fn challenge_entropy_is_skip_safe_and_timing_invariant() {
+        let exact = slot_hashes_data(&[(110, 11), (105, 22), (104, 33)]);
+        assert_eq!(slothash_at_or_after_data(&exact, 105).unwrap(), 22);
+
+        let skipped = slot_hashes_data(&[(111, 44), (108, 55), (104, 66)]);
+        assert_eq!(slothash_at_or_after_data(&skipped, 105).unwrap(), 55);
+
+        let too_early = slot_hashes_data(&[(104, 77), (103, 88)]);
+        assert!(slothash_at_or_after_data(&too_early, 105).is_err());
+
+        let aged_out = slot_hashes_data(&[(700, 99), (600, 111)]);
+        assert!(slothash_at_or_after_data(&aged_out, 100).is_err());
+
+        let mut truncated = slot_hashes_data(&[(110, 1), (104, 2)]);
+        truncated.pop();
+        assert!(slothash_at_or_after_data(&truncated, 105).is_err());
+    }
 
     #[test]
     fn rating_delta_never_crosses_the_floor() {

@@ -24,7 +24,9 @@ slots (Weapon, Head, Body, Gloves, Boots, Amulet, Ring) plus reserved slots.
 (`programs/solana-ekza-arena/src/lib.rs:95`, handler in `handlers.rs` around
 `pub fn equip_item_v2`) writes `record.slots[slot] = mint` — the equipped item's
 real NFT mint is stored on chain, so the character's loadout is on-chain state,
-not a client-side cosmetic. The handler is **holder-gated**: it requires the
+not a client-side cosmetic. Before writing it clears any previous occurrence of
+the same mint, so one NFT cannot occupy several compatible slots. The handler is
+**holder-gated**: it requires the
 owner's token account to actually hold the mint being equipped, and enforces the
 item's base-type ↔ slot compatibility and the avatar's `slot_mask`. So "equipped"
 provably means "this wallet holds this NFT and has bound it to this slot on

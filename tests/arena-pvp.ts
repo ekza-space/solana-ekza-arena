@@ -27,7 +27,7 @@ describe("arena-leaderboard :: async PvP", () => {
     .arenaLeaderboard as Program<ArenaLeaderboard>;
   const connection = provider.connection;
 
-  const PVP_COMMIT_WINDOW_SLOTS = 128; // must match constants.rs
+  const PVP_COMMIT_WINDOW_SLOTS = 300; // must match constants.rs
   const SLOT_HASHES_SYSVAR = new anchor.web3.PublicKey(
     "SysvarS1otHashes111111111111111111111111111"
   );
@@ -41,7 +41,11 @@ describe("arena-leaderboard :: async PvP", () => {
     )[0];
   const challengePda = (challenger: anchor.web3.PublicKey, nonce: anchor.BN) =>
     anchor.web3.PublicKey.findProgramAddressSync(
-      [Buffer.from("challenge_v1"), challenger.toBuffer(), nonce.toArrayLike(Buffer, "le", 8)],
+      [
+        Buffer.from("challenge_v1"),
+        challenger.toBuffer(),
+        nonce.toArrayLike(Buffer, "le", 8),
+      ],
       program.programId
     )[0];
   const charRecordPda = (
@@ -57,7 +61,10 @@ describe("arena-leaderboard :: async PvP", () => {
       [Buffer.from("player_stats_v1"), player.toBuffer()],
       program.programId
     )[0];
-  const pairCooldownPda = (lo: anchor.web3.PublicKey, hi: anchor.web3.PublicKey) =>
+  const pairCooldownPda = (
+    lo: anchor.web3.PublicKey,
+    hi: anchor.web3.PublicKey
+  ) =>
     anchor.web3.PublicKey.findProgramAddressSync(
       [Buffer.from("pair_cd_v1"), lo.toBuffer(), hi.toBuffer()],
       program.programId
@@ -86,17 +93,30 @@ describe("arena-leaderboard :: async PvP", () => {
     }
   };
 
-  // First 8 LE bytes of the SlotHashes entry for `slot` (fixed once written).
-  const slotHashFirst8 = async (slot: number): Promise<bigint> => {
+  // First 8 LE bytes of the earliest produced slot at/after the committed
+  // target. This mirrors the skip-safe on-chain entropy selection.
+  const slotHashFirst8 = async (targetSlot: number): Promise<bigint> => {
     const info = await connection.getAccountInfo(SLOT_HASHES_SYSVAR);
     const data = info!.data;
     const len = Number(data.readBigUInt64LE(0));
+    let candidate: bigint | null = null;
     for (let i = 0; i < len; i++) {
       const base = 8 + i * 40;
-      if (Number(data.readBigUInt64LE(base)) === slot)
+      const producedSlot = Number(data.readBigUInt64LE(base));
+      if (producedSlot === targetSlot) {
         return data.readBigUInt64LE(base + 8);
+      }
+      if (producedSlot > targetSlot) {
+        candidate = data.readBigUInt64LE(base + 8);
+      } else if (candidate !== null) {
+        return candidate;
+      } else {
+        break;
+      }
     }
-    throw new Error(`slot hash for ${slot} aged out of the sysvar`);
+    throw new Error(
+      `first produced slot at/after ${targetSlot} is not provable from SlotHashes`
+    );
   };
 
   const zeros32 = () => Array(32).fill(0);
@@ -216,7 +236,10 @@ describe("arena-leaderboard :: async PvP", () => {
     });
     await program.methods
       .initLeaderboard(8)
-      .accountsPartial({ leaderboard: board, authority: boardAuthority.publicKey })
+      .accountsPartial({
+        leaderboard: board,
+        authority: boardAuthority.publicKey,
+      })
       .preInstructions([createIx])
       .signers([boardAuthority, boardKp])
       .rpc();
@@ -239,7 +262,11 @@ describe("arena-leaderboard :: async PvP", () => {
         skillMask: s.skillMask,
       });
       const nonce = BigInt(`0x${v.seedHex}`);
-      const { winnerIsA, rounds } = resolveWinner(toSim(v.a), toSim(v.b), nonce);
+      const { winnerIsA, rounds } = resolveWinner(
+        toSim(v.a),
+        toSim(v.b),
+        nonce
+      );
       expect(winnerIsA, `winner ${v.note}`).to.equal(v.expectedWinner === "A");
       expect(rounds, `rounds ${v.note}`).to.equal(v.expectedRounds);
       checked += 1;
@@ -368,7 +395,9 @@ describe("arena-leaderboard :: async PvP", () => {
 
     // PairCooldown created and this fight consumed the pair's rated allowance.
     const [lo, hi] = sortPair(w1.publicKey, w2.publicKey);
-    const pcd = await program.account.pairCooldown.fetch(pairCooldownPda(lo, hi));
+    const pcd = await program.account.pairCooldown.fetch(
+      pairCooldownPda(lo, hi)
+    );
     expect(pcd.rankedToday).to.equal(1);
     expect(pcd.lastRankedSlot.toNumber()).to.be.greaterThan(0);
   });
@@ -418,7 +447,9 @@ describe("arena-leaderboard :: async PvP", () => {
 
     // The pair's rated allowance was NOT consumed again.
     const [lo, hi] = sortPair(w1.publicKey, w2.publicKey);
-    const pcd = await program.account.pairCooldown.fetch(pairCooldownPda(lo, hi));
+    const pcd = await program.account.pairCooldown.fetch(
+      pairCooldownPda(lo, hi)
+    );
     expect(pcd.rankedToday).to.equal(1);
   });
 

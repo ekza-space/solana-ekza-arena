@@ -16,9 +16,13 @@ Program ID (localnet/dev): `D3a99Wj3eLLn4jbXU5rLDbaFT6giQiUbmcPkiyQSM8iZ`
   real tradeable NFT (SPL mint supply 1 / decimals 0 + Metadata + Master
   Edition); the `ArenaItem` PDA seeded by the mint holds the immutable rolled
   stats. Ownership = current NFT holder, never `minter`.
-- **Player avatar** (`PlayerAvatar`) — one per wallet. The player's character:
-  chosen Avatar card, display name, cosmetic skin, and four equip slots
-  (Weapon/Head/Armor/Charm) holding equipped item NFT mints.
+- **Player avatar** (`PlayerAvatar` + `EquipmentRecord`) — one per wallet. The
+  active character and a seven-slot durable loadout (Weapon/Head/Body/Gloves/
+  Boots/Amulet/Ring); legacy four-slot fields remain a compatibility mirror.
+- **Minted fighter** — a 1/1 NFT revealed with exact symbol `EKZAF0..3` plus a
+  canonical `ArenaAssetData { Avatar }` PDA at `["arena_avatar_v1", mint]`.
+  `activate_fighter_v2` proves the current holder ATA and clears both loadout
+  representations atomically when switching fighters.
 - **Fair randomness** — two mint paths:
   - `mint_arena_item` (1 tx): a registry-authority-only development/admin
     path, seeded from the recent SlotHash and hard-capped at Legendary. Public
@@ -27,7 +31,7 @@ Program ID (localnet/dev): `D3a99Wj3eLLn4jbXU5rLDbaFT6giQiUbmcPkiyQSM8iZ`
     charges and immediately distributes a non-refundable fee; reveal rolls from
     that slot's then-unknown hash. Grind-resistant — the only path that can roll
     **Mythic (1/1000)**.
-  - A commit expires 128 slots after its target. Anyone may clean it up after
+  - A commit expires 300 slots after its target. Anyone may clean it up after
     expiry, but all PDA rent returns to the original minter; the fee was already
     distributed and is never refundable or held in the commit.
 - **Creator economics** — recommended launch fee is 0.002 SOL, governed as basis points
@@ -59,12 +63,15 @@ Program ID (localnet/dev): `D3a99Wj3eLLn4jbXU5rLDbaFT6giQiUbmcPkiyQSM8iZ`
 | `register_arena_asset_from_stellar` | Bridge a finalized Stellar release as a skin-only card. |
 | `mint_arena_item` | 1-tx mint of a rolled item NFT (≤ Legendary). |
 | `commit_mint` / `reveal_mint` | Commit-reveal mint (full ladder incl. Mythic). |
+| `reveal_avatar_mint` | Consume a paid mint commit and create a fighter NFT plus mint-keyed Avatar PDA with deterministic stats. |
 | `close_expired_commit` | Permissionlessly close an expired commit; rent returns to its minter. |
 | `scrap_arena_item` | Burn item NFT + close its PDA (holder only). |
 | `create_player_avatar` | Create the wallet's character from an Avatar card. |
 | `customize_avatar` | Rename, change cosmetic skin, or swap the base card (swap clears equips). |
+| `activate_fighter_v2` | Holder-gated create/switch to a canonical minted fighter; clears legacy and v2 equipment. |
 | `equip_item` | Equip an owned item NFT into the slot implied by its base type. |
 | `unequip_item` | Clear one equip slot. |
+| `equip_item_v2` / `unequip_item_v2` | Write the seven-slot EquipmentRecord; moving a mint removes any prior occurrence. |
 
 Equipping does not lock the NFT — clients must treat a slot as valid only
 while the avatar owner still holds the mint's token.

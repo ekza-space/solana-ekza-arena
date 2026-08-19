@@ -13,7 +13,7 @@
     },
     "solanaEkzaArena": {
       "branch": "main",
-      "commit": "6b7c017837ac904810e337677a1f774aa487511c"
+      "commit": "fe9448b70fe823885edfe5d06a025c3615d8de8e"
     }
   },
   "programs": {
@@ -28,22 +28,30 @@
     "solanaEkzaArena": {
       "programId": "D3a99Wj3eLLn4jbXU5rLDbaFT6giQiUbmcPkiyQSM8iZ",
       "programdataAddress": "BkEE9MohpLthgBjUjB3d8BdEZGeTZxeCP4ngXuaBPQPM",
-      "lastDeploySlot": 478325585,
-      "dataLen": 982384,
-      "binarySha256": "3b7a51aa678ea43a6e68961319e5d037da51826356d0c262b7ab0bc3884913a9",
+      "lastDeploySlot": 485363116,
+      "dataLen": 1102384,
+      "binaryBytes": 1077376,
+      "binarySha256": "e34f132cf4f02d45cf0ca5d596a3661a415909727eb3daf50284050ee1c1c3d2",
       "deploySignature": "mEmiP2fKgXL8BDVJDyFRy2ETznfYqctpLjPVqDJAdPgsubbRG3H2pq4MH7WLECquGYGXbPyroZBCrKdjFGxtb5F",
       "upgradeSignature_2026-08-13": "31kjaXTrAS6ffeageUvPLNJJFS3b871Wb5GmA2WVtcnGR3TKL2kMnRFuq3voqyGfXYfUSXhHGUMhyjdejcq1rKp",
-      "note": "enhancement (\u0437\u0430\u0442\u043e\u0447\u043a\u0430) instructions added; upgraded 2026-08-13"
+      "extendSignature_2026-08-18_fighter_v3": "4WKVQ6fdqgNuXXgkp5YhmsUWKZyDUNySNwXBhXhXypqKaJ1HwHdx9K4v8D7tqZRduDGXS3aeMjhKRbZY6smroNKz",
+      "extendSlot_2026-08-18_fighter_v3": 485134317,
+      "extendedAt_2026-08-18_fighter_v3": "2026-08-18T15:15:49Z",
+      "upgradeSignature_2026-08-19_fighter_v3": "2qaG1NkHiyn9anGbsqNqb83HyxkY8n6PVofUHR1NgCJ6CLmRnfm7irVgAkqNuE5g15oZiWCQeWPMrS1EUdDKSeSh",
+      "upgradeSlot_2026-08-19_fighter_v3": 485363116,
+      "upgradedAt_2026-08-19_fighter_v3": "2026-08-19T08:09:11Z",
+      "note": "enhancement instructions upgraded 2026-08-13; fighter v3/equipment v2/skip-safe commit-reveal artifact upgraded 2026-08-19 after +120000-byte extend"
     },
     "arenaLeaderboard": {
       "programId": "9A5PkCQrsp98SNBfVRiRs5zVdnzxVdRZQFy2ZDDGjaeU",
       "programdataAddress": "6grSTXx5HMs4bfpktRi1cZKF4UCR9hSbbFtmVeasrjFz",
-      "lastDeploySlot": 478325634,
-      "dataLen": 416232,
-      "binarySha256": "d297b8b2c5ab60c2f734e42aba7df09fe0d21b605ee3979f89fe091bd2baa829",
+      "lastDeploySlot": 485371261,
+      "dataLen": 420792,
+      "binarySha256": "922a9876b7abaa2c...",
       "deploySignature": "5qtKk7pRJQDBXGG6ruqGWkAzeyhqXDYohivcMRmX37cAXx3jnxkuFkznm3Y6mg5mSiH5MVdGsYtBEFJUuUiRDAzV",
       "upgradeSignature_2026-08-13_pvp": "3nFcbz8PGtAwEpvzv7kdiS699ix3hp4JVC2AgivtdNxGby36Kvvqr4EqSYkpWChUkzw5W5Wi5ThCVtDT5aQLgv8T",
-      "note": "async PvP ladder + per-character history added; upgraded 2026-08-13 (extend +150000 then buffer swap)"
+      "note": "PvP ladder + per-char history; upgraded 2026-08-19 via Helius",
+      "upgradeSignature_2026-08-19_pvp_v2": "3XAD8JYKR3vLmpDeewDnixzf4BJfTo72Dz15gMBCZYM4U56JQUdD7kDkn6Uib5sLwjjJjgaEDQyFxbDqGa4vtJk"
     }
   },
   "arenaRegistry": {
